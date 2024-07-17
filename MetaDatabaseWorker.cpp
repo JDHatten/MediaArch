@@ -53,13 +53,8 @@ void MetaDatabaseWorker::updateRecord()
 
 void MetaDatabaseWorker::getRecord()
 {
-    // TODO: return a list of records from each table
-
-    //std::vector<QSqlRecord> all_available_records;
-    //std::map<QString, QSqlRecord> table_record_map;
-    std::map<QString, QSqlRecord>* table_record_map = new std::map<QString, QSqlRecord>; // pointer??
-    //QSqlRecord record;
-    //QSqlRecord* record = new QSqlRecord();
+    std::map<QString, QSqlRecord>* table_record_map = new std::map<QString, QSqlRecord>; // deleted after used in databaseRecordsRetrieved signal in MediaViewer
+    //table_record_map = std::make_unique<std::map<QString, QSqlRecord>>();
 
     if (GenerateFileId()) {
 
@@ -83,7 +78,6 @@ void MetaDatabaseWorker::getRecord()
                     while (query.next()) { // if this loops then its a new stream/track
                         QSqlRecord record;
                         record = query.record();
-                        //all_available_records.push_back(query.record());
 
                         if (track_num)
                             table_record_map->emplace(table + (QVariant(track_num).toString()), query.record());
@@ -107,7 +101,6 @@ void MetaDatabaseWorker::getRecord()
 
     if (table_record_map->size())
         emit databaseRecordsRetrieved(file_path, table_record_map);
-    //emit databaseRecordRetrieved(record);
 }
 
 MetaDatabaseWorker::~MetaDatabaseWorker()
@@ -179,7 +172,7 @@ bool MetaDatabaseWorker::GenerateFileId(bool use_265_bit_hash)
 bool MetaDatabaseWorker::OpenDatabase()
 {
     QString dbt_name = QString(DatabaseSchema::Database::Name) + QString("Thread-%1-%2")
-        .arg(reinterpret_cast<intptr_t>(QThread::currentThreadId())).arg(rand() % 256);
+        .arg(reinterpret_cast<intptr_t>(QThread::currentThreadId())).arg(rand() % INT16_MAX);
     database = QSqlDatabase::cloneDatabase(DatabaseSchema::Database::ConnectionName, dbt_name);
     return database.open();
 }
@@ -193,8 +186,6 @@ bool MetaDatabaseWorker::ExistsInDatabase()
     qDebug() << "ExistsInDatabase():" << select;
     QSqlQuery query(select, database);
     //query.prepare(select);
-    //query.bindValue(":table", DatabaseSchema::Table::General::Title);
-    //query.bindValue(":field", DatabaseSchema::Table::General::Field::Id);
     //query.bindValue(":file_id", file_id);
 
     if (not query.exec()) {
@@ -216,24 +207,22 @@ bool MetaDatabaseWorker::ExistsInDatabase()
     return false;
 }
 
-int MetaDatabaseWorker::BuildMetadataMaps()
+MediaItem::Type::Filter MetaDatabaseWorker::BuildMetadataMaps()
 {
-    //MediaInfoDLL::MediaInfoList media_info_file;
+    // Using MediaInfoDLL get all metadata from file.
     MediaInfoDLL::MediaInfo media_info_file;
     size_t media_file = media_info_file.Open(file_path);
-    //qDebug() << "Raw Data -> " << media_info_file.Inform();
-
+    //qDebug() << "Summarized Raw Data -> " << media_info_file.Inform();
     if (not media_info_file.IsReady()) {
         return MediaItem::Type::Unknown;
     }
-
     for (int stream_type = 0; stream_type < MediaInfoDLL::stream_t::Stream_Max; stream_type++) {
         MediaInfoDLL::stream_t stream_kind = static_cast<MediaInfoDLL::stream_t>(stream_type);
-        int stream_count = stringToNumber(QString::fromStdWString(media_info_file.Get(stream_kind, 0, 2, MediaInfoDLL::Info_Text).c_str())).toInt();
+        int stream_count = QVariant(QString::fromStdWString(media_info_file.Get(stream_kind, 0, 2, MediaInfoDLL::Info_Text).c_str())).toInt();
         qDebug() << "Stream Kind:" << MEDIA_INFO::print(stream_kind) << "| Streams/Tracks:" << stream_count;
         
         for (int stream = 0; stream < stream_count; stream++) {
-            int param_count = stringToNumber(QString::fromStdWString(media_info_file.Get(stream_kind, stream, 0, MediaInfoDLL::Info_Text).c_str())).toInt();
+            int param_count = QVariant(QString::fromStdWString(media_info_file.Get(stream_kind, stream, 0, MediaInfoDLL::Info_Text).c_str())).toInt();
             int param_alt_index = 0;
             int preferred_param_alt = 0;
             std::wstring last_param;
@@ -275,39 +264,63 @@ int MetaDatabaseWorker::BuildMetadataMaps()
         }
     }*/
 
-    // Get media type from metadata
-    if (general_metadata_maps.size()) {
-        media_type = MediaItem::Type::Other;
+    // Get media type and filter based on metadata gathered.
+    if (general_metadata_maps.size())
+        media_filters = MediaItem::Type::Other;
+    if (video_metadata_maps.size())
+        media_filters |= MediaItem::Type::Video;
+    if (audio_metadata_maps.size())
+        media_filters |= MediaItem::Type::Audio;
+    if (music_metadata_maps.size())
+        media_filters |= MediaItem::Type::Music;
+    if (image_metadata_maps.size())
+        media_filters |= MediaItem::Type::Image;
+    media_type = MediaItem::Type::getTypeFromFilter(media_filters);
+
+
+    // TODO: if Other or Image, load file into OpenCV to get more metadata and thumbnail?
+
+
+    //std::filesystem::perms file_permissions = std::filesystem::status(file_path).permissions();
+    //int file_permissions = int(std::filesystem::status(file_path).permissions());
+    //bool file_read_only = !int(std::filesystem::perms::owner_write) & file_permissions;
+
+    // Get Other File Attributes
+    // https://learn.microsoft.com/en-us/windows/win32/fileio/file-attribute-constants
+    DWORD attributes = GetFileAttributes(file_path.wstring().c_str()); // Windows Only
+    bool file_read_only = attributes & FILE_ATTRIBUTE_READONLY;
+    bool file_hidden = attributes & FILE_ATTRIBUTE_HIDDEN;
+    bool file_system = attributes & FILE_ATTRIBUTE_SYSTEM; // operating system file
+    bool file_device = attributes & FILE_ATTRIBUTE_DEVICE; // reserved 
+    bool file_temp = attributes & FILE_ATTRIBUTE_TEMPORARY; // temporary storage file
+    bool file_sparse = attributes & FILE_ATTRIBUTE_SPARSE_FILE; // basically an empty file
+    bool file_reparse = attributes & FILE_ATTRIBUTE_REPARSE_POINT; // usually a symbolic link (mounted drive?)
+    bool file_compressed = attributes & FILE_ATTRIBUTE_COMPRESSED;
+    bool file_encrypted = attributes & FILE_ATTRIBUTE_ENCRYPTED;
+    bool file_virtual = attributes & FILE_ATTRIBUTE_VIRTUAL; // reserved 
+    bool file_extended = attributes & FILE_ATTRIBUTE_EA; // extended attributes
+
+    // Resolve file links to get their targeted paths (Windows)
+    std::filesystem::path target_path;
+    if (file_reparse) {
+        std::error_code ec;
+        target_path = std::filesystem::read_symlink(file_path, ec);
     }
-    if (video_metadata_maps.size()) {
-        media_type = MediaItem::Type::Video;
-    }
-    else {
-        if (audio_metadata_maps.size()) {
-            if (media_type == MediaItem::Type::Other)
-                media_type = MediaItem::Type::Audio;
-        }
-        if (music_metadata_maps.size()) {
-            if (media_type == MediaItem::Type::Audio)
-                media_type = MediaItem::Type::Music;
-        }
-        if (image_metadata_maps.size()) {
-            if (media_type == MediaItem::Type::Other)
-                media_type = MediaItem::Type::Image;
+    if (file_path.extension() == ".lnk") {
+        TCHAR resolved_path[MAX_PATH] = { 0 };
+        resolveWindowsLink(NULL, file_path.string().c_str(), resolved_path, MAX_PATH);
+
+        if (*resolved_path != NULL) {
+            target_path = resolved_path;
+            if (std::filesystem::exists(target_path)) {
+                target_path.make_preferred();
+                target_path = std::filesystem::canonical(target_path);
+            }
         }
     }
+    QString target_path_str = QString::fromStdString(target_path.string());
 
-
-
-    // TODO: if Other or Image, load file into OpenCV to get more metadata and thumbnail
-
-
-
-    // TODO: Not sure about this. Save all metadata and just pick and choose which one to display/use in app. If preferred field is missing/empty look for another.
-    // Still may need to handle dupes, preferring dupe if first is empty.
-    //ChoosePreferredKeys(music_metadata_maps.at(0).get(), DatabaseSchema::Table::Music::Field::Publisher);
-
-
+    // Get thumbnail data and/or paths.
     CreateThumbnailImages();
 
     // Add key value pairs to metadata maps not included in media info. Only strings? other data types will be added in database insert queries.
@@ -317,15 +330,16 @@ int MetaDatabaseWorker::BuildMetadataMaps()
     AddAdditionalDatabaseFields(audio_metadata_maps, DatabaseSchema::Table::Audio::Field::Id, file_id);
     AddAdditionalDatabaseFields(music_metadata_maps, DatabaseSchema::Table::Music::Field::Id, file_id);
     AddAdditionalDatabaseFields(image_metadata_maps, DatabaseSchema::Table::Music::Field::Id, file_id);
-
     AddAdditionalDatabaseFields(general_metadata_maps, DatabaseSchema::Table::General::Field::MediaType, media_type);
+    AddAdditionalDatabaseFields(general_metadata_maps, DatabaseSchema::Table::General::Field::MediaStreams, media_filters);
     AddAdditionalDatabaseFields(general_metadata_maps, DatabaseSchema::Table::General::Field::FileSize, file_size, false);
     AddAdditionalDatabaseFields(general_metadata_maps, DatabaseSchema::Table::General::Field::FileCreated, file_date_created, false);
     AddAdditionalDatabaseFields(general_metadata_maps, DatabaseSchema::Table::General::Field::FileLastMod, file_date_modified, false);
-    AddAdditionalDatabaseFields(general_metadata_maps, DatabaseSchema::Table::General::Field::FileReadOnly, ":file_read_only");
-    AddAdditionalDatabaseFields(general_metadata_maps, DatabaseSchema::Table::General::Field::FileHidden, ":file_hidden");
-    //AddAdditionalDatabaseFields(general_metadata_maps, DatabaseSchema::Table::General::Field::EncodedDate, ":encode_date", false);
-    AddAdditionalDatabaseFields(general_metadata_maps, DatabaseSchema::Table::General::Field::Thumbnail, ":thumbnail");
+    AddAdditionalDatabaseFields(general_metadata_maps, DatabaseSchema::Table::General::Field::FileReadOnly, file_read_only);
+    AddAdditionalDatabaseFields(general_metadata_maps, DatabaseSchema::Table::General::Field::FileHidden, file_hidden);
+    AddAdditionalDatabaseFields(general_metadata_maps, DatabaseSchema::Table::General::Field::FileTargetPath, target_path_str);
+    AddAdditionalDatabaseFields(general_metadata_maps, DatabaseSchema::Table::General::Field::ThumbnailData, ":thumbnail");
+    AddAdditionalDatabaseFields(general_metadata_maps, DatabaseSchema::Table::General::Field::ThumbnailPath, thumbnail_path);
 
     /*/ Print Out... GENERAL
     for (const auto& m : general_metadata_maps) {
@@ -351,7 +365,7 @@ int MetaDatabaseWorker::BuildMetadataMaps()
             qDebug() << "M{" << p.first << " => " << p.second << "}";
         }
     }//*/
-    // IMAGE
+    /*/ IMAGE
     for (const auto& m : image_metadata_maps) {
         for (auto const& p : *m) {
             qDebug() << "I{" << p.first << " => " << p.second << "}";
@@ -363,10 +377,16 @@ int MetaDatabaseWorker::BuildMetadataMaps()
 
 MetaDatabaseWorker::KeyValuePair MetaDatabaseWorker::GetProperKeyAndValue(std::wstring key, std::wstring value, MediaInfoDLL::stream_t stream_kind)
 {
+    // TODO: Sterilize All Values (Tested: ' " \) (So far only ' needs special escaping)
+    intptr_t found_index = -2;
+    while (found_index != value.npos) {
+        found_index = value.find_first_of(L"'", found_index+2);
+        if (found_index != value.npos)
+            value.insert(found_index, L"'");
+            //value.replace(found_index, 1, L"\""); // Use to test a possible problem char. 
+    };
     QString new_key = "";
     QVariant new_val = QString::fromStdWString(value); // TODO: skip converting this to QString, if it's just going to end up a number?
-
-    // TODO: Sterilize All Values
 
     if (MediaInfoDLL::stream_t::Stream_General == stream_kind) {
         if (key == MEDIA_INFO::GENERAL::ALBUM) { // Music Table
@@ -384,7 +404,7 @@ MetaDatabaseWorker::KeyValuePair MetaDatabaseWorker::GetProperKeyAndValue(std::w
         else if (key == MEDIA_INFO::GENERAL::AUDIO_LANGUAGE_LIST) { // Table???
             new_key = DatabaseSchema::Table::General::Field::AudioLanguageList;
         }
-        else if (key == MEDIA_INFO::GENERAL::CODEC_ID) { // Video Table
+        else if (key == MEDIA_INFO::GENERAL::CODEC_ID) {
             new_key = DatabaseSchema::Table::General::Field::CodecId;
         }
         else if (key == MEDIA_INFO::GENERAL::COMMENT) { // Music Table
@@ -433,7 +453,7 @@ MetaDatabaseWorker::KeyValuePair MetaDatabaseWorker::GetProperKeyAndValue(std::w
         /*else if (key == MEDIA_INFO::GENERAL::FILE_SIZE) { // Added later with a number in bytes
             new_key = DatabaseSchema::Table::General::Field::FileSize;
         }*/
-        else if (key == MEDIA_INFO::GENERAL::FORMAT) {  // Video, Audio or Music Table
+        else if (key == MEDIA_INFO::GENERAL::FORMAT) {
             new_key = DatabaseSchema::Table::General::Field::Format;
         }
         else if (key == MEDIA_INFO::GENERAL::FORMAT_PROFILE) { // Video Table
@@ -444,6 +464,7 @@ MetaDatabaseWorker::KeyValuePair MetaDatabaseWorker::GetProperKeyAndValue(std::w
         }
         else if (key == MEDIA_INFO::GENERAL::FRAME_RATE) {
             new_key = DatabaseSchema::Table::General::Field::FrameRate;
+            new_val = new_val.toDouble();
         }
         else if (key == MEDIA_INFO::GENERAL::GENRE) { // Music Table
             new_key = DatabaseSchema::Table::Music::Field::Genre;
@@ -489,7 +510,7 @@ MetaDatabaseWorker::KeyValuePair MetaDatabaseWorker::GetProperKeyAndValue(std::w
         }
         else if (key == MEDIA_INFO::GENERAL::RECORDED_DATE) { // Music Table
             new_key = DatabaseSchema::Table::Music::Field::RecordedDate;
-            new_val = stringToNumber(new_val.toString()); // This should just be the year, else treat it like DateTime
+            new_val = new_val.toInt(); // This should just be the year, else treat it like DateTime
         }
         else if (key == MEDIA_INFO::GENERAL::RELEASE_COUNTRY) { // Music Table
             new_key = DatabaseSchema::Table::Music::Field::ReleaseCountry;
@@ -500,15 +521,19 @@ MetaDatabaseWorker::KeyValuePair MetaDatabaseWorker::GetProperKeyAndValue(std::w
         else if (key == MEDIA_INFO::GENERAL::STREAM_SIZE) {
             new_key = DatabaseSchema::Table::General::Field::StreamSize;
         }
-        else if (key == MEDIA_INFO::GENERAL::TAGGED_DATE) { // Video Table
+        else if (key == MEDIA_INFO::GENERAL::TAGGED_DATE) {
             new_key = DatabaseSchema::Table::General::Field::TaggedDate;
             new_val = dateTimeStringToSeconds(new_val.toString());
+        }
+        else if (key == MEDIA_INFO::GENERAL::TITLE) { // Music Table
+            new_key = DatabaseSchema::Table::Music::Field::Title;
         }
         else if (key == MEDIA_INFO::GENERAL::TRACK_NAME) { // Music Table
             new_key = DatabaseSchema::Table::Music::Field::TrackName;
         }
         else if (key == MEDIA_INFO::GENERAL::TRACK_NUMBER) { // Music Table
             new_key = DatabaseSchema::Table::Music::Field::TrackNumber;
+            new_val = new_val.toInt();
         }
         else if (key == MEDIA_INFO::GENERAL::WEBPAGE) { // Music Table
             new_key = DatabaseSchema::Table::Music::Field::AudioURL; // 3 in General (Music), Preferred Order: 3
@@ -530,7 +555,7 @@ MetaDatabaseWorker::KeyValuePair MetaDatabaseWorker::GetProperKeyAndValue(std::w
         }
         else if (key == MEDIA_INFO::VIDEO::BIT_RATE) {
             new_key = DatabaseSchema::Table::Graphic::Field::BitRate;
-            new_val = stringToNumber(new_val.toString());
+            new_val = new_val.toInt();
         }
         else if (key == MEDIA_INFO::VIDEO::CHROMA_SUBSAMPLING) {
             new_key = DatabaseSchema::Table::Graphic::Field::ChromaSubsampling;
@@ -558,7 +583,7 @@ MetaDatabaseWorker::KeyValuePair MetaDatabaseWorker::GetProperKeyAndValue(std::w
         }
         else if (key == MEDIA_INFO::VIDEO::DURATION) {
             new_key = DatabaseSchema::Table::Graphic::Field::Duration;
-            new_val = stringToNumber(new_val.toString());
+            new_val = new_val.toInt();
         }
         else if (key == MEDIA_INFO::VIDEO::ENCODED_DATE) {
             new_key = DatabaseSchema::Table::Graphic::Field::EncodedDate;
@@ -584,22 +609,22 @@ MetaDatabaseWorker::KeyValuePair MetaDatabaseWorker::GetProperKeyAndValue(std::w
         }
         else if (key == MEDIA_INFO::VIDEO::FRAME_COUNT) {
             new_key = DatabaseSchema::Table::Graphic::Field::FrameCount;
-            new_val = stringToNumber(new_val.toString());
+            new_val = new_val.toInt();
         }
         else if (key == MEDIA_INFO::VIDEO::FRAME_RATE) {
             new_key = DatabaseSchema::Table::Graphic::Field::FrameRate;
-            new_val = stringToNumber(new_val.toString());
+            new_val = new_val.toDouble();
         }
         else if (key == MEDIA_INFO::VIDEO::FRAME_RATE_MODE) {
             new_key = DatabaseSchema::Table::Graphic::Field::FrameRateMode;
         }
         else if (key == MEDIA_INFO::VIDEO::HEIGHT) {
             new_key = DatabaseSchema::Table::Graphic::Field::Height;
-            new_val = stringToNumber(new_val.toString());
+            new_val = new_val.toInt();
         }
         else if (key == MEDIA_INFO::VIDEO::ID) {
             new_key = DatabaseSchema::Table::Graphic::Field::TrackId;
-            new_val = stringToNumber(new_val.toString());
+            new_val = new_val.toInt();
         }
         else if (key == MEDIA_INFO::VIDEO::LANGUAGE) {
             new_key = DatabaseSchema::Table::Graphic::Field::Language;
@@ -609,14 +634,14 @@ MetaDatabaseWorker::KeyValuePair MetaDatabaseWorker::GetProperKeyAndValue(std::w
         }
         else if (key == MEDIA_INFO::VIDEO::ROTATION) {
             new_key = DatabaseSchema::Table::Graphic::Field::Rotation;
-            new_val = stringToNumber(new_val.toString());
+            new_val = new_val.toDouble();
         }
         else if (key == MEDIA_INFO::VIDEO::SCAN_TYPE) {
             new_key = DatabaseSchema::Table::Graphic::Field::ScanType;
         }
         else if (key == MEDIA_INFO::VIDEO::STREAM_SIZE) {
             new_key = DatabaseSchema::Table::Graphic::Field::StreamSize;
-            new_val = stringToNumber(new_val.toString());
+            new_val = new_val.toInt();
         }
         else if (key == MEDIA_INFO::VIDEO::TAGGED_DATE) {
             new_key = DatabaseSchema::Table::Graphic::Field::TaggedDate;
@@ -627,7 +652,7 @@ MetaDatabaseWorker::KeyValuePair MetaDatabaseWorker::GetProperKeyAndValue(std::w
         }
         else if (key == MEDIA_INFO::VIDEO::WIDTH) {
             new_key = DatabaseSchema::Table::Graphic::Field::Width;
-            new_val = stringToNumber(new_val.toString());
+            new_val = new_val.toInt();
         }
         else if (key == MEDIA_INFO::VIDEO::WRITING_LIBRARY) {
             new_key = DatabaseSchema::Table::Graphic::Field::WritingLibrary;
@@ -640,14 +665,14 @@ MetaDatabaseWorker::KeyValuePair MetaDatabaseWorker::GetProperKeyAndValue(std::w
         }*/
         if (key == MEDIA_INFO::AUDIO::BIT_RATE) {
             new_key = DatabaseSchema::Table::Audio::Field::BitRate;
-            new_val = stringToNumber(new_val.toString());
+            new_val = new_val.toInt();
         }
         else if (key == MEDIA_INFO::AUDIO::BIT_RATE_MODE) {
             new_key = DatabaseSchema::Table::Audio::Field::BitRateMode;
         }
         else if (key == MEDIA_INFO::AUDIO::CHANNELS) {
             new_key = DatabaseSchema::Table::Audio::Field::Channels;
-            new_val = stringToNumber(new_val.toString());
+            new_val = new_val.toInt();
         }
         else if (key == MEDIA_INFO::AUDIO::CHANNELS_LAYOUT) {
             new_key = DatabaseSchema::Table::Audio::Field::ChannelLayout;
@@ -666,7 +691,7 @@ MetaDatabaseWorker::KeyValuePair MetaDatabaseWorker::GetProperKeyAndValue(std::w
         //}
         else if (key == MEDIA_INFO::AUDIO::DURATION) {
             new_key = DatabaseSchema::Table::Audio::Field::Duration;
-            new_val = stringToNumber(new_val.toString());
+            new_val = new_val.toInt();
         }
         else if (key == MEDIA_INFO::AUDIO::ENCODED_DATE) {
             new_key = DatabaseSchema::Table::Audio::Field::EncodedDate;
@@ -689,18 +714,19 @@ MetaDatabaseWorker::KeyValuePair MetaDatabaseWorker::GetProperKeyAndValue(std::w
         }*/
         else if (key == MEDIA_INFO::AUDIO::FRAME_COUNT) {
             new_key = DatabaseSchema::Table::Audio::Field::FrameCount;
-            new_val = stringToNumber(new_val.toString());
+            new_val = new_val.toInt();
         }
         else if (key == MEDIA_INFO::AUDIO::FRAME_RATE) {
             new_key = DatabaseSchema::Table::Audio::Field::FrameRate;
-            new_val = stringToNumber(new_val.toString());
+            //new_val = stringToNumber(new_val.toString());
+            new_val = new_val.toDouble();
         }
         else if (key == MEDIA_INFO::AUDIO::ID) {
             new_key = DatabaseSchema::Table::Audio::Field::TrackId;
-            new_val = stringToNumber(new_val.toString());
+            new_val = new_val.toDouble();
         }
         else if (key == MEDIA_INFO::AUDIO::LANGUAGE) {
-            new_key = DatabaseSchema::Table::Audio::Field::Language; // 2 in Video and Audio, Preferred Order: 1
+            new_key = DatabaseSchema::Table::Audio::Field::Language;
         }
         else if (key == MEDIA_INFO::AUDIO::MAX_BIT_RATE) {
             new_key = DatabaseSchema::Table::Audio::Field::BitRate;
@@ -710,23 +736,23 @@ MetaDatabaseWorker::KeyValuePair MetaDatabaseWorker::GetProperKeyAndValue(std::w
         }*/
         else if (key == MEDIA_INFO::AUDIO::REPLAY_GAIN) {
             new_key = DatabaseSchema::Table::Audio::Field::ReplayGain;
-            new_val = stringToNumber(new_val.toString());
+            new_val = new_val.toDouble();
         }
         else if (key == MEDIA_INFO::AUDIO::REPLAY_GAIN_PEAK) {
             new_key = DatabaseSchema::Table::Audio::Field::ReplayGainPeak;
-            new_val = stringToNumber(new_val.toString());
+            new_val = new_val.toDouble();
         }
         else if (key == MEDIA_INFO::AUDIO::SAMPLING_COUNT) {
             new_key = DatabaseSchema::Table::Audio::Field::SamplingCount;
-            new_val = stringToNumber(new_val.toString());
+            new_val = new_val.toInt();
         }
         else if (key == MEDIA_INFO::AUDIO::SAMPLING_RATE) {
             new_key = DatabaseSchema::Table::Audio::Field::SamplingRate;
-            new_val = stringToNumber(new_val.toString());
+            new_val = new_val.toInt();
         }
         else if (key == MEDIA_INFO::AUDIO::STREAM_SIZE) {
             new_key = DatabaseSchema::Table::Audio::Field::StreamSize;
-            new_val = stringToNumber(new_val.toString());
+            new_val = new_val.toInt();
         }
         else if (key == MEDIA_INFO::AUDIO::TAGGED_DATE) {
             new_key = DatabaseSchema::Table::Audio::Field::TaggedDate;
@@ -862,30 +888,86 @@ void MetaDatabaseWorker::ChoosePreferredKeys(std::map<QString, QVariant>* metada
     }
 }
 
+HRESULT MetaDatabaseWorker::resolveWindowsLink(HWND hwnd, LPCSTR lpszLinkFile, LPWSTR lpszPath, int iPathBufferSize)
+{
+    HRESULT hres;
+    IShellLink* psl;
+    WCHAR szGotPath[MAX_PATH];
+    WCHAR szDescription[MAX_PATH];
+    WIN32_FIND_DATA wfd;
+    *lpszPath = 0; // Assume failure 
+
+    // Get a pointer to the IShellLink interface. It is assumed that CoInitialize has already been called. 
+    hres = CoCreateInstance(CLSID_ShellLink, NULL, CLSCTX_INPROC_SERVER, IID_IShellLink, (LPVOID*)&psl);
+    if (SUCCEEDED(hres)) {
+        IPersistFile* ppf;
+        // Get a pointer to the IPersistFile interface. 
+        hres = psl->QueryInterface(IID_IPersistFile, (void**)&ppf);
+        if (SUCCEEDED(hres)) {
+            WCHAR wsz[MAX_PATH];
+            // Ensure that the string is Unicode. 
+            MultiByteToWideChar(CP_ACP, 0, lpszLinkFile, -1, wsz, MAX_PATH);
+
+            // Add code here to check return value from MultiByteWideChar for success.
+
+            // Load the shortcut. 
+            hres = ppf->Load(wsz, STGM_READ);
+            if (SUCCEEDED(hres)) {
+                // Resolve the link. 
+                hres = psl->Resolve(hwnd, 0);
+                if (SUCCEEDED(hres)) {
+                    // Get the path to the link target. 
+                    hres = psl->GetPath(szGotPath, MAX_PATH, (WIN32_FIND_DATA*)&wfd, SLGP_SHORTPATH);
+                    if (SUCCEEDED(hres)) {
+                        // Get the description of the target. 
+                        hres = psl->GetDescription(szDescription, MAX_PATH);
+                        if (SUCCEEDED(hres)) {
+                            hres = StringCbCopy(lpszPath, iPathBufferSize, szGotPath);
+                            if (SUCCEEDED(hres)) {
+                                // Handle success
+                            }
+                            else {
+                                // Handle the error
+                            }
+                        }
+                    }
+                }
+            }
+            // Release the pointer to the IPersistFile interface. 
+            ppf->Release();
+        }
+        // Release the pointer to the IShellLink interface. 
+        psl->Release();
+    }
+    return hres;
+}
+
 void MetaDatabaseWorker::CreateThumbnailImages()
 {
-    if (media_type == MediaItem::Type::Music) {
-        // TODO: search for files named: folder, cover, front, etc and extensions jpg, png, etc.
-        // Search in the music file's current directory and it's parent.
-        //std::filesystem::path thumbnail_link = file_path.parent_path().parent_path() / "folder.jpg";
-        std::filesystem::path thumbnail_link = file_path.parent_path() / "folder.jpg";
+    if (media_filters & (MediaItem::Type::Video | MediaItem::Type::Image | MediaItem::Type::Music)) {
+    
+        //int duration;
+        int frame_count;
+        int thumbnail_count;
+        int frame_interval;
+        int skip_frames_above;
 
-        if (std::filesystem::exists(thumbnail_link)) {
-            qDebug() << "Found Music Thumbnail:" << thumbnail_link.string();
+        if (media_filters & MediaItem::Type::Video) {
+            // TODO: Backup/Alt: do some math and get maximum frames in video, use it to set frame_interval.
+            //       If frames not in metadata, get duration and frame rate. else guess based on file size.  duration / 30 FPS?
+            //       Even if FPS is wrong it should get close to the right number of thumbnails spread across the video.
+            //duration = general_metadata_maps.at(0)->at(DatabaseSchema::Table::General::Field::Duration).toInt();
+            frame_count = general_metadata_maps.at(0)->at(DatabaseSchema::Table::Graphic::Field::FrameCount).toInt();
+            thumbnail_count = 8; // TODO: user setting
+            frame_interval = frame_count / (thumbnail_count + 1);
+            skip_frames_above = frame_count - frame_interval;
 
-            QString thumbnail_path_str = QString::fromStdString(thumbnail_link.string());
-            //qDebug() << "thumbnail_path_str:" << thumbnail_path_str;
-
-            thumbnail_data.append(thumbnail_path_str.toStdString().c_str());
-
-            //qDebug() << "qbytes_str:" << thumbnail_data.toStdString();
-
-            //QString str_from_qbytes = QString(thumbnail_data);
-            //QString str_from_qbytes = QString::fromUtf8(thumbnail_data);
-            //qDebug() << "str_from_qbytes:" << str_from_qbytes;
+            //qDebug() << "duration:" << duration << " - frame_count:" << frame_count << " - frame_interval:" << frame_interval;
         }
-    }
-    else if (media_type == MediaItem::Type::Video) {
+        else {
+            frame_interval = 1;
+            skip_frames_above = 2;
+        }
 
         int return_value = 0;
         AVPacket* packet;
@@ -903,40 +985,31 @@ void MetaDatabaseWorker::CreateThumbnailImages()
         else {
             // 
             if ((return_value = LoadInAVContexts(file_path.string().c_str())) > -1) {
+                    while (av_read_frame(fmt_ctx, packet) >= 0) {
+                        if (packet->stream_index == video_stream_index) {
 
-                // TODO: do some math and get maximum frames in video, use it to set mod number
-                // If frames not in metadata, get duration and frame rate. else guess on size.
-                // duration / 30? even if FPS is wrong it will get close to the right number of thumbnails spread across the video.
-                int duration = general_metadata_maps.at(0)->at(DatabaseSchema::Table::General::Field::Duration).toInt();
-                int frame_count = general_metadata_maps.at(0)->at(DatabaseSchema::Table::Graphic::Field::FrameCount).toInt();
-                int thumbnail_count = 8;
-                int frame_interval = frame_count / (thumbnail_count + 1);
-                int skip_frames_above = frame_count - frame_interval;
+                            // Skip last thumbnail, else it will be a frame near the end of video.
+                            if (dec_ctx->frame_num < skip_frames_above) {
 
-                qDebug() << "duration:" << duration << " - frame_count:" << frame_count << " - frame_interval:" << frame_interval;
+                                rgb_frame = DecodeFrame(dec_ctx, frame, packet, frame_interval);
+                                if (rgb_frame) {
+                                    //QImage thumbnail_image = FrameToImage(rgb_frame);
+                                    //thumbnail_images.push_back(thumbnail_image);
+                                    //thumbnail_pixmap->convertFromImage(thumbnail_image);
 
-                // READ ALL THE PACKETS - simple
-                while (av_read_frame(fmt_ctx, packet) >= 0) {
-                    if (packet->stream_index == video_stream_index) {
-
-                        // Skip last thumbnail, else it will be a frame near the end of video.
-                        if (dec_ctx->frame_num < skip_frames_above) {
-                            
-                            rgb_frame = DecodeFrame(dec_ctx, frame, packet, frame_interval);
-                            if (rgb_frame) {
-                                //QImage thumbnail_image = FrameToImage(rgb_frame);
-                                //thumbnail_images.push_back(thumbnail_image);
-                                //thumbnail_pixmap->convertFromImage(thumbnail_image);
-
-                                QPixmap* thumbnail_pixmap = FrameToPixmap(rgb_frame);
-                                thumbnail_images.push_back(*thumbnail_pixmap);
-                                av_frame_free(&rgb_frame);
-                                delete thumbnail_pixmap;
+                                    QPixmap* thumbnail_pixmap = FrameToPixmap(rgb_frame);
+                                    thumbnail_images.push_back(*thumbnail_pixmap);
+                                    av_frame_free(&rgb_frame);
+                                    delete thumbnail_pixmap;
+                                }
+                            }
+                            else {
+                                av_packet_unref(packet);
+                                break;
                             }
                         }
+                        av_packet_unref(packet);
                     }
-                    av_packet_unref(packet);
-                }
             }
             avcodec_free_context(&dec_ctx);
             avformat_close_input(&fmt_ctx);
@@ -946,10 +1019,9 @@ void MetaDatabaseWorker::CreateThumbnailImages()
         av_frame_free(&frame);
         av_packet_free(&packet);
 
-        if (return_value < 0 && return_value != AVERROR_EOF) {
-            qDebug() << "Error occurred:" << return_value;
+        if (return_value < 0 and return_value != AVERROR_EOF) {
+            qWarning() << "ERROR: AV Loading Error:" << return_value;
         }
-
         if (thumbnail_images.size()) {
             //thumbnail_data = QByteArray::fromRawData(reinterpret_cast<const char*>(thumbnail_images.data()), thumbnail_images.size());
             QDataStream out(&thumbnail_data, QIODevice::WriteOnly);
@@ -963,37 +1035,134 @@ void MetaDatabaseWorker::CreateThumbnailImages()
             thumbnail_data = 0;
         }
     }
+
+    if (media_type & MediaItem::Type::Image) {
+        thumbnail_path = QString::fromStdString(file_path.string());
+    }
+    // TODO: Always look for image on disk to use for thumbnail or only when none created/found from file?  user setting?  thumbnail_data.isEmpty() 
+    else if (media_type > MediaItem::Type::Other) {
+        // Search in the file's current and parent directory for files named: folder, cover, front, etc and extensions jpg, png, etc.
+        std::filesystem::path thumbnail_link;
+        for (auto const& dir_entry : std::filesystem::recursive_directory_iterator{ file_path.parent_path(), std::filesystem::directory_options::skip_permission_denied }) {
+            std::string stem = dir_entry.path().stem().string();
+            std::string ext = dir_entry.path().extension().string();
+            if (stem == "cover" or stem == "folder" or stem == "front" or stem == "front-cover" or stem == "embedded" or stem == file_path.stem().string()) {
+                if (ext == ".jpg" or ext == ".jpeg" or ext == ".png" or ext == ".bpm") {
+                    thumbnail_link = dir_entry.path();
+                    thumbnail_link.make_preferred();
+                    break;
+                }
+            }
+        }
+        if (not std::filesystem::exists(thumbnail_link)) {
+            for (auto const& dir_entry : std::filesystem::directory_iterator{ file_path.parent_path().parent_path(), std::filesystem::directory_options::skip_permission_denied }) {
+                std::string stem = dir_entry.path().stem().string();
+                std::string ext = dir_entry.path().extension().string();
+                if (stem == "cover" or stem == "folder" or stem == "front" or stem == "front-cover") {
+                    if (ext == ".jpg" or ext == ".jpeg" or ext == ".png" or ext == ".bpm") {
+                        thumbnail_link = dir_entry.path();
+                        thumbnail_link.make_preferred();
+                        break;
+                    }
+                }
+            }
+        }
+        if (std::filesystem::exists(thumbnail_link)) {
+            qDebug() << "Found Music Thumbnail:" << thumbnail_link.string();
+            thumbnail_path = QString::fromStdString(thumbnail_link.string());
+        }
+    }
 }
 
-int MetaDatabaseWorker::LoadInAVContexts(const char* filename)
+int MetaDatabaseWorker::LoadInAVContexts(const char* file_path_char, int force_jpeg_codec_for_embedded_stream, bool embedded_file_saved)
 {
     int return_value;
     const AVCodec* dec;
 
     fmt_ctx = avformat_alloc_context();
 
-    if ((return_value = avformat_open_input(&fmt_ctx, filename, NULL, NULL)) < 0) {
+    if ((return_value = avformat_open_input(&fmt_ctx, file_path_char, NULL, NULL)) < 0) {
         qDebug() << "ERROR: failed to open input file";
         return return_value;
+    }
+
+    // Force jpeg codec if missing context.
+    if (force_jpeg_codec_for_embedded_stream > -1) {
+        fmt_ctx->streams[force_jpeg_codec_for_embedded_stream]->codecpar->codec_id = AV_CODEC_ID_MJPEG;
     }
 
     if ((return_value = avformat_find_stream_info(fmt_ctx, NULL)) < 0) {
         qDebug() << "ERROR: failed to find stream information";
         return return_value;
     }
+    
+    /*// Alt video stream finder
+    for (int i = 0; i < fmt_ctx->nb_streams; i++) {
 
-    return_value = av_find_best_stream(fmt_ctx, AVMEDIA_TYPE_VIDEO, -1, -1, &dec, 0);
+        if (fmt_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+            // Find the decoder for the video stream
+            dec = avcodec_find_decoder(fmt_ctx->streams[i]->codecpar->codec_id); //AV_CODEC_ID_PNG  AV_CODEC_ID_MJPEG
+            if (dec == NULL) {
+                fprintf(stderr, "Unsupported codec!\n");
+                return -1; // Codec not found
+            }
+            return_value = i;
+            break;
+        }
+    }//*/
+
+    return_value = av_find_best_stream(fmt_ctx, AVMediaType::AVMEDIA_TYPE_VIDEO, -1, -1, &dec, 0);
     if (return_value < 0) {
         qDebug() << "ERROR: failed to find a video stream in the input file";
         return return_value;
     }
     video_stream_index = return_value;
 
+    // If no useful context found for an image, try forcing jpeg codec. (sometimes PNG images are embedded, but are actually Jpegs)
+    if (force_jpeg_codec_for_embedded_stream == -1 and fmt_ctx->streams[video_stream_index]->codecpar->format == -1)
+        return LoadInAVContexts(file_path_char, video_stream_index);
+
+    /*/ Alt or back up option: Not enough useful context to modify image, saving image to disk to be loaded back in.
+    if (embedded_file_saved and fmt_ctx->streams[video_stream_index]->codecpar->format == -1) {
+        qDebug() << "Last resort, keep image on disk and load from image file when needed for thumbnail.";
+        return -1;
+    }
+    if (embedded_file_saved) {
+        std::filesystem::path embed_file_path = (file_path.parent_path() / "embedded.jpg").make_preferred();
+        std::filesystem::remove(embed_file_path);
+    }
+    else if (fmt_ctx->streams[video_stream_index]->codecpar->format == -1) {
+        if (fmt_ctx->streams[video_stream_index]->attached_pic.size) {
+
+            std::filesystem::path embed_file_path = (file_path.parent_path() / "embedded.jpg").make_preferred();
+            std::string embed_file_path_str = embed_file_path.string();
+            const char* embed_file_path_c = embed_file_path_str.c_str();
+
+            if (not std::filesystem::exists(embed_file_path)) {
+                AVPacket packet = fmt_ctx->streams[video_stream_index]->attached_pic;
+                FILE* image_file = fopen(embed_file_path_c, "wb");
+                int result = fwrite(packet.data, packet.size, 1, image_file);
+                fclose(image_file);
+            }
+            return LoadInAVContexts(embed_file_path_c, -2, true);
+        }
+        return -1;
+    }//*/
+
+    /*/ Packet Save Test
+    AVPacket* packet;
+    packet = av_packet_alloc();
+    av_read_frame(fmt_ctx, packet);
+    FILE* image_file = fopen("embedded.jpg", "wb");
+    int result = fwrite(packet->data, packet->size, 1, image_file);
+    fclose(image_file);//*/
+    
     dec_ctx = avcodec_alloc_context3(dec);
     if (!dec_ctx) {
         qDebug() << "ERROR: failed to allocate decoding context/memory";
         return AVERROR(ENOMEM);
     }
+
     avcodec_parameters_to_context(dec_ctx, fmt_ctx->streams[video_stream_index]->codecpar);
 
     // Initiate the video decoder
@@ -1011,6 +1180,22 @@ AVFrame* MetaDatabaseWorker::DecodeFrame(AVCodecContext* codec_ctx, AVFrame* fra
     int return_value = avcodec_send_packet(codec_ctx, packet);
     if (return_value < 0) {
         qDebug() << "ERROR: error sending packet for decoding";
+        switch (errno) {
+        case AVERROR(EAGAIN):
+            qDebug() << "Input is not accepted in the current state - user must read output with avcodec_receive_frame() (once all output is read, the packet should be resent, and the call will not fail with EAGAIN).";
+            break;
+        case AVERROR_EOF:
+            qDebug() << "The decoder has been flushed, and no new packets can be sent to it (also returned if more than 1 flush packet is sent).";
+            break;
+        case AVERROR(EINVAL):
+            qDebug() << "Codec not opened, it is an encoder, or requires flush.";
+            break;
+        case AVERROR(ENOMEM):
+            qDebug() << "Failed to add packet to internal queue, or similar.";
+            break;
+        default:
+            qDebug() << "Legitimate decoding errors:" << return_value;
+        }
         return nullptr;
     }
 
@@ -1018,59 +1203,119 @@ AVFrame* MetaDatabaseWorker::DecodeFrame(AVCodecContext* codec_ctx, AVFrame* fra
     int media_item_size = 256;
 
     // Scale image keeping aspect ratio
-    int scaled_width = dec_ctx->width;
-    int scaled_hieght = dec_ctx->height;
-    if (scaled_width > scaled_hieght) {
-        scaled_hieght = scaled_hieght / (scaled_width / media_item_size);
+    int scaled_width = codec_ctx->width;
+    int scaled_height = codec_ctx->height;
+    if (scaled_width > scaled_height) {
+        scaled_height = scaled_height / (scaled_width / media_item_size);
         scaled_width = media_item_size;
     }
-    else if (scaled_hieght > scaled_width) {
-        scaled_width = scaled_width / (scaled_hieght / media_item_size);
-        scaled_hieght = media_item_size;
+    else if (scaled_height > scaled_width) {
+        scaled_width = scaled_width / (scaled_height / media_item_size);
+        scaled_height = media_item_size;
     }
     else {
         scaled_width = media_item_size;
-        scaled_hieght = media_item_size;
+        scaled_height = media_item_size;
     }
 
+    // Get frame back from decoder - (put this back if problems arise later)
+    return_value = avcodec_receive_frame(codec_ctx, frame);
+
+    // If resource temporaily not available or end of file reached, error out.
+    if (return_value == AVERROR(EAGAIN) || return_value == AVERROR_EOF) {
+        return nullptr; // Can still go again if more frames available
+    }
+    else if (return_value < 0) {
+        qWarning() << "ERROR: Frame decoding failure, failed to receive frame.";
+        return nullptr;
+    }
+
+    AVPixelFormat src_format = (AVPixelFormat)frame->format;
+    AVPixelFormat dst_format = AV_PIX_FMT_RGB24;
+
     // Create a scalar context for conversion
-    SwsContext* sws_ctx = sws_getContext(dec_ctx->width, dec_ctx->height, dec_ctx->pix_fmt,
-        scaled_width, scaled_hieght, AV_PIX_FMT_RGB24, SWS_BICUBIC, NULL, NULL, NULL);
+    //SwsContext* sws_ctx = sws_getContext(codec_ctx->width, codec_ctx->height, codec_ctx->pix_fmt, scaled_width, scaled_height, dst_format, SWS_BICUBIC, NULL, NULL, NULL);
+    SwsContext* sws_ctx = sws_getContext(frame->width, frame->height, src_format, scaled_width, scaled_height, dst_format, SWS_BICUBIC, NULL, NULL, NULL);
+
+    if (sws_ctx == nullptr) {
+        qWarning() << "ERROR: Missing image context, scaling failed.";
+        return nullptr;
+    }
 
     // Create a new RGB frame for conversion
     AVFrame* rgb_frame = av_frame_alloc();
-    rgb_frame->format = AV_PIX_FMT_RGB24;
+    rgb_frame->format = dst_format;
+    /////rgb_frame->format = AV_PIX_FMT_RGB24;
+    //rgb_frame->format = codec_ctx->pix_fmt;
     //rgb_frame->format = AV_PIX_FMT_RGB32;
     //rgb_frame->format = AV_PIX_FMT_YUV420P;
     //rgb_frame->format = AV_PIX_FMT_YUV440P;
+    //rgb_frame->format = AV_PIX_FMT_YUV444P;
     //rgb_frame->format = AV_PIX_FMT_BGRA;
+    //rgb_frame->format = AV_PIX_FMT_BGR24;
     rgb_frame->width = scaled_width;
-    rgb_frame->height = scaled_hieght;
-
+    rgb_frame->height = scaled_height;
+    
     // Allocate a new buffer for the RGB conversion frame
     av_frame_get_buffer(rgb_frame, 0);
 
+    /*/ Alt: prepare line sizes structure  and char buffer in array... as sws_scale expects
+    int rgb_linesizes[8] = { 0 };
+    rgb_linesizes[0] = 3 * frame->width;
+    unsigned char* rgb_data[8];
+    int image_byte_size = 3 * frame->height * frame->width;
+    rgb_data[0] = (unsigned char*)malloc(image_byte_size + 64); // alloc extra 64 bytes
+    if (!rgb_data[0]) {
+        qDebug() << "Error allocating buffer for frame conversion";
+        free(rgb_data[0]);
+        sws_freeContext(sws_ctx);
+        return nullptr;
+    }//*/
+
     // Run while frames are available with no errors
-    while (return_value >= 0) {
+    if (return_value >= 0) {
         
-        // Get frame back from decoder
-        return_value = avcodec_receive_frame(codec_ctx, frame);
+        /*/ Get frame back from decoder
+        return_value = avcodec_receive_frame(codec_ctx, frame); // put this back if problems arise later
         
         // If resource temporaily not available or end of file reached, error out.
         if (return_value == AVERROR(EAGAIN) || return_value == AVERROR_EOF) {
             return nullptr; // Can still go again if more frames available
         }
         else if (return_value < 0) {
-            qDebug() << "ERROR: error during frame decoding";
+            qWarning() << "ERROR: Frame decoding failure, failed to receive frame.";
             return nullptr;
-        }
+        }//*/
 
         // Get only the (mod)'th frame...
-        if (codec_ctx->frame_number % mod == 0) {
-            qDebug().nospace() << "Decoding frame #" << codec_ctx->frame_number;
+        if (codec_ctx->frame_num % mod == 0) {
+            qDebug().nospace() << "Decoding frame #" << codec_ctx->frame_num;
 
             // Scale/Convert the old frame to the new RGB frame
             sws_scale(sws_ctx, frame->data, frame->linesize, 0, frame->height, rgb_frame->data, rgb_frame->linesize);
+            
+            /*/ Alt
+            sws_scale(sws_ctx, frame->data, frame->linesize, 0, frame->height, rgb_data, rgb_linesizes);
+            QImage image(scaled_width, scaled_height, QImage::Format::Format_RGB888); // AV_PIX_FMT_YUVJ444P to AV_PIX_FMT_RGB24
+            for (size_t y = 0; y < scaled_height; y++) {
+                memcpy(image.scanLine(y), rgb_data[0] + y * rgb_linesizes[0], 3 * scaled_width);
+            }
+            image.save("test.jpg");//*/
+
+            /*/ Frame Test Save
+            FILE* pFile;
+            char szFilename[32];
+            //sprintf(szFilename, "frame%d.ppm", 1);
+            sprintf(szFilename, "frame%d.jpg", 1);
+            pFile = fopen(szFilename, "wb");
+            if (pFile == NULL)
+                return nullptr;
+            // Write header
+            fprintf(pFile, "P6\n%d %d\n255\n", rgb_frame->width, rgb_frame->height);
+            // Write pixel data
+            for (int y = 0; y < rgb_frame->height; y++)
+                fwrite(rgb_frame->data[0] + y * rgb_frame->linesize[0], 1, rgb_frame->width * 3, pFile);
+            fclose(pFile);//*/
 
             return rgb_frame;
         }
@@ -1080,9 +1325,11 @@ AVFrame* MetaDatabaseWorker::DecodeFrame(AVCodecContext* codec_ctx, AVFrame* fra
 
 QPixmap* MetaDatabaseWorker::FrameToPixmap(const AVFrame* frame) const
 {
-    QImage image(frame->width, frame->height, QImage::Format::Format_RGB888);
-    for (int y = 0; y < frame->height; y++) {
-        memcpy(image.scanLine(y), frame->data[0] + y * 3 * frame->width, 3 * frame->width);
+    QImage image(frame->width, frame->height, QImage::Format::Format_RGB888); // Format_RGB888 - AV_PIX_FMT_YUVJ444P to AV_PIX_FMT_RGB24
+    size_t pix_multi = 3; // 3-24, 4-32, 5-64
+    for (size_t y = 0; y < frame->height; y++) {
+        memcpy(image.scanLine(y), frame->data[0] + y * frame->linesize[0], pix_multi * frame->width);
+        //memcpy(image.scanLine(y), frame->data[0] + y * pix_multi * frame->width, pix_multi * frame->width);
     }
     //image.save("test.jpg");
     QPixmap* pixmap = new QPixmap();
@@ -1160,7 +1407,7 @@ QImage MetaDatabaseWorker::FrameToImage(const AVFrame* frame) const
 
 void MetaDatabaseWorker::AddAdditionalDatabaseFields(std::map<QString, QVariant>* metadata_map, QString key, QVariant value, bool overwrite)
 {
-    if (metadata_map and not metadata_map->empty())
+    if (metadata_map and not metadata_map->empty() and value.isValid())
         if (metadata_map->contains(key)) {
             if (overwrite)
                 metadata_map->at(key) = value;
@@ -1189,11 +1436,14 @@ QString MetaDatabaseWorker::BuildDatabaseInsertQueryString(std::map<QString, QVa
         insert = QString("INSERT INTO %1 (").arg(table);
         values = "VALUES (";
         for (auto& metadata : *metadata_map) {
-            insert.append(QString("'%1', ").arg(metadata.first));
-            if (metadata.second.toString().at(0) == QString(":"))
-                values.append(QString("%1, ").arg(metadata.second.toString())); // "variable" placeholder, value added later
-            else if (metadata.second.typeId() == QMetaType::QString)
-                values.append(QString("'%1', ").arg(metadata.second.toString())); // string
+            insert.append(QString("\"%1\", ").arg(metadata.first));
+            qDebug() << metadata.second;
+            if (metadata.second.typeId() == QMetaType::QString) {
+                if (metadata.second.toString().length() and metadata.second.toString().at(0) == QString(":"))
+                    values.append(QString("%1, ").arg(metadata.second.toString())); // "variable" placeholder, value added later
+                else
+                    values.append(QString("'%1', ").arg(metadata.second.toString())); // string
+            }
             else //if (metadata.second.typeId() == QMetaType::Int or metadata.second.typeId() == QMetaType::Double)
                 values.append(QString("%1, ").arg(metadata.second.toString())); // number or some other kind of data
         }
@@ -1237,11 +1487,11 @@ bool MetaDatabaseWorker::AddToDatabase()
         }
 
         if (query.exec()) {
-            qDebug() << "New Values Added Successfully to DB for file:" << file_path_str;
+            qDebug() << "New Values added successfully to DB for file:"<< file_path.filename().string() << " | Query:" << query.lastQuery();
             //success = true;
         }
         else {
-            qDebug() << "ERROR: Failed To Add Values:" << query.lastError();
+            qDebug() << "ERROR: Failed To add Values from file:" << file_path.filename().string() << " | " << query.lastError();
             qDebug() << "ERROR: The Failed Query:" << query.lastQuery();
             success = false;
         }
@@ -1252,6 +1502,7 @@ bool MetaDatabaseWorker::AddToDatabase()
     return success;
 }
 
+// Not Needed, Delete?
 QVariant MetaDatabaseWorker::stringToNumber(QString str)
 {
     QString str_val;
