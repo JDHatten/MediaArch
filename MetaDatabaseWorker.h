@@ -49,14 +49,14 @@ class MetaDatabaseWorker : public QObject
 public:
 
     static enum DatabaseUpdateCode {
-        Failed, New, Updated, Existed
+        Failed, NewlyAdded, Updated, AlreadyExisted, NewDuplicateAdded
     };
     struct KeyValuePair {
         QString key;
         QVariant value;
     };
 
-    MetaDatabaseWorker(std::filesystem::path file_path, QObject* parent = nullptr);
+    MetaDatabaseWorker(std::filesystem::path file_path, int user_id, bool refresh_metadata = false, std::map<QString, QVariant>* updated_user_meta = nullptr, QObject* parent = nullptr);
     ~MetaDatabaseWorker();
 
     /// <summary>
@@ -77,6 +77,7 @@ private:
     std::filesystem::path file_path;
     QString file_path_str;
     QString file_id = "0";
+    int user_id = 0;
     size_t file_size = 0;
     time_t file_date_created = 0;
     time_t file_date_modified = 0;
@@ -89,19 +90,23 @@ private:
     AVCodecContext* dec_ctx = nullptr;
     int video_stream_index = -1;
 
-    std::vector< std::unique_ptr<std::map<QString, QVariant>> > general_metadata_maps; // Note: There should never be multiple General streams/tracks.
+    // Note: There should never be multiple "General Streams/Tracks/Maps".  However, there can be multiple "General Tables" for duplicate files.
+    std::vector< std::unique_ptr<std::map<QString, QVariant>> > general_metadata_maps;
     std::vector< std::unique_ptr<std::map<QString, QVariant>> > video_metadata_maps;
     std::vector< std::unique_ptr<std::map<QString, QVariant>> > audio_metadata_maps;
     std::vector< std::unique_ptr<std::map<QString, QVariant>> > music_metadata_maps;
     std::vector< std::unique_ptr<std::map<QString, QVariant>> > image_metadata_maps;
 
-    //std::unique_ptr<std::map<QString, QSqlRecord>> table_record_map;
+    bool duplicate_file_found = false;
+    bool update_metadata = false;
+    std::map<QString, QVariant>* user_meta = nullptr;
 
     bool GenerateFileId(bool use_265_bit_hash = false);
     bool OpenDatabase();
-    bool ExistsInDatabase();
+    bool ExistsInDatabase(QString table = MA::General::Title);
 
     MediaItem::Type::Filter BuildMetadataMaps();
+    QVariant SterilizeValue(std::wstring value);
     KeyValuePair GetProperKeyAndValue(const std::wstring key, const std::wstring value, const MediaInfoDLL::stream_t stream_kind);
     bool PlaceKeyValuePairIntoCorrectMap(KeyValuePair key_value_pair, MediaInfoDLL::stream_t stream_kind, int stream);
     void ChoosePreferredKeys(std::map<QString, QVariant>* metadata_map, QString key, int num = 0, bool delete_other_keys = false);
@@ -115,12 +120,15 @@ private:
     void AddAdditionalDatabaseFields(std::map<QString, QVariant>* mi_map, QString key, QVariant value, bool overwrite = true);
     void AddAdditionalDatabaseFields(std::vector< std::unique_ptr<std::map<QString, QVariant>> >& metadata_maps, QString key, QVariant value, bool overwrite = true, int stream = -1);
     bool AddToDatabase();
-    QString BuildDatabaseInsertQueryString(std::map<QString, QVariant>* mi_map, const QString table);
-
+    bool UpdateDatabase();
+    bool ExecuteQueryStrings(QList<QString> query_strings);
+    QString BuildDatabaseInsertQueryString(std::map<QString, QVariant>* mi_map, const QString table) const;
+    QString BuildDatabaseUpdateQueryString(std::map<QString, QVariant>* mi_map, const QString table) const;
+    
 public slots:
 
     void addRecord();
-    void updateRecord();
+    bool updateRecord();
     void getRecord();
 
 signals:
