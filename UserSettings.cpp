@@ -17,7 +17,7 @@ void UserSettings::loadUserSettings()
     if (database.open()) {
        QString select = QString("SELECT * FROM \"%1\" WHERE \"%2\" = %3")
             .arg(DatabaseSchema::Tables::Settings)
-            .arg(DatabaseSchema::Table::Settings::Field::UserId)
+            .arg(Field::Settings::UserId)
             .arg(UserId);
         QSqlQuery query(database);
         query.prepare(select);
@@ -40,13 +40,23 @@ void UserSettings::loadUserSettings()
         query.finish();
     }
     database.close();
+
+    // Convert "DirectoryListHistory" String to StringList
+    if (user_record.contains(Field::Settings::DirectoryListHistory)) {
+        QString directory_history_str = user_record.value(Field::Settings::DirectoryListHistory).toString();
+        QStringList directory_list_history;
+        if (directory_history_str.length()) {
+            directory_list_history = directory_history_str.split("|");
+        }
+        setUserSetting(Field::Settings::DirectoryListHistory, directory_list_history);
+    }
 }
 
 bool UserSettings::CreateNewUserSettingsRecord()
 {
     QString insert = QString("INSERT INTO \"%1\" (\"%2\") VALUES (%3)")
         .arg(DatabaseSchema::Tables::Settings)
-        .arg(DatabaseSchema::Table::Settings::Field::UserId)
+        .arg(Field::Settings::UserId)
         .arg(UserId);
     //qDebug() << insert;
     QSqlQuery query(database);
@@ -63,7 +73,7 @@ bool UserSettings::CreateNewUserSettingsRecord()
 
 bool UserSettings::saveUserSettings()
 {
-    return saveUserSettings(DatabaseSchema::Table::Settings::Field::getAllFields());
+    return saveUserSettings(Field::Settings::getAllFields());
 }
 bool UserSettings::saveUserSettings(QString field)
 {
@@ -75,19 +85,25 @@ bool UserSettings::saveUserSettings(QList<QString> fields)
         QList<QString> update_list;
         QString update = QString("UPDATE \"%1\" SET ").arg(DatabaseSchema::Tables::Settings);
         for (auto& field : fields) {
-            if (field == DatabaseSchema::Table::Settings::Field::UserId)
+            if (field == Field::Settings::UserId)
                 continue; // Skip updating UserId
             QVariant qval = getUserSetting(field);
-            if (qval.typeId() == QMetaType::QString)
-                update_list.push_back(QString("\"%1\" = '%2'").arg(field).arg(qval.toString())); // string
+            if (qval.typeId() == QMetaType::QString) {
+                //QString str = qval.toString().replace("'", "\'"); // Sterilize
+                update_list.push_back(QString("\"%1\" = \"%2\"").arg(field).arg(qval.toString())); // string
+            }
+            else if (qval.typeId() == QMetaType::QStringList) {
+                // Save StringList as one String
+                QString list_to_str = qval.toStringList().join("|");
+                update_list.push_back(QString("\"%1\" = \"%2\"").arg(field).arg(list_to_str)); // data / blob
+            }
             else
                 update_list.push_back(QString("\"%1\" = %2").arg(field).arg(qval.toString())); // number or some other kind of data
         }
         update += update_list.join(", ");
         update += QString(" WHERE \"%1\" = %2")
-            .arg(DatabaseSchema::Table::Settings::Field::UserId)
+            .arg(Field::Settings::UserId)
             .arg(UserId);
-        //qDebug() << update;
         QSqlQuery query(database);
         query.prepare(update);
         if (query.exec()) {
@@ -142,7 +158,7 @@ bool UserSettings::setUserSetting(QString field, QVariant value, bool save_user_
 
 void UserSettings::printSettings() const
 {
-    for (auto& field : DatabaseSchema::Table::Settings::Field::getAllFields()) {
+    for (auto& field : Field::Settings::getAllFields()) {
         QVariant qval = getUserSetting(field);
         qDebug() << field << ":" << qval;
     }
