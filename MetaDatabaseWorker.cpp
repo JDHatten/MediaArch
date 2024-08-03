@@ -1,10 +1,10 @@
 #include "MetaDatabaseWorker.h"
 
-MetaDatabaseWorker::MetaDatabaseWorker(std::filesystem::path file_path, int user_id, bool refresh_metadata, std::map<QString, QVariant>* updated_user_meta, QObject* parent)
-    : QObject(parent), file_path(file_path), user_id(user_id), update_metadata(refresh_metadata), user_meta(updated_user_meta)
+MetaDatabaseWorker::MetaDatabaseWorker(std::filesystem::path file_path, int user_id, int update_filter, std::map<QString, QVariant>* updated_user_meta, QObject* parent)
+    : QObject(parent), file_path(file_path), user_id(user_id), update_filter(update_filter), user_meta(updated_user_meta)
 {
     MetaDatabaseWorker::file_path_str = QString::fromStdString(file_path.make_preferred().string());
-    qDebug().nospace() << "MetaDatabaseWorker Constructed (" << file_path_str << ")";
+    //qDebug().nospace() << "MetaDatabaseWorker Constructed (" << file_path_str << ")";
     //general_metadata_maps.reserve(1);
 }
 
@@ -15,14 +15,14 @@ MetaDatabaseWorker::~MetaDatabaseWorker()
         delete fmt_ctx;
     if (dec_ctx)
         delete dec_ctx;
-    qDebug().nospace() << "...MetaDatabaseWorker Deconstructed (" << file_path.filename().string() << ")";
+    //qDebug().nospace() << "...MetaDatabaseWorker Deconstructed (" << file_path.filename().string() << ")";
 }
 
 void MetaDatabaseWorker::addRecord()
 {
     general_metadata_maps.push_back(std::make_unique<std::map<QString, QVariant>>());
     //general_metadata_maps.shrink_to_fit();
-    int db_code = DatabaseUpdateCode::Failed;
+    MA::Database::FinishCode db_code = MA::Database::FinishCode::Failed;
 
     // Get File Id/Hash
     if (GenerateFileId()) {
@@ -31,15 +31,28 @@ void MetaDatabaseWorker::addRecord()
 
             if (ExistsInDatabase()) {
                 
-                if (update_metadata or user_meta) {
+                if ((MA::Update::Metadata | MA::Update::SmallFileThumbnails | MA::Update::AllFileThumbnails) & update_filter or user_meta) {
 
-                    if (update_metadata) {
+                    // Update only thumbnails?
+                    if (MA::Update::Metadata & update_filter) {
                         media_type = BuildMetadataMaps();
-                        qDebug().nospace() << "This '" << MediaItem::Type::print(media_type) << "' file already exists in the database, but it will be updated.";
+                        //qDebug().nospace() << "This '" << MA::printType(media_type) << "' file already exists in the database, but it will be updated.";
                     }
+
+                    // TODO: by default always get "small file thumbnails"   user setting: how big is a "small file"
+                    if (MA::Update::AllFileThumbnails & update_filter) {
+                        CreateThumbnailImages();
+                    }
+                    else if (MA::Update::SmallFileThumbnails & update_filter) {
+                        if (media_type & MA::Type::Video and file_size < video_thumbnail_max_file_size)
+                            CreateThumbnailImages();
+                        else if (media_type != MA::Type::Video and file_size < non_video_thumbnail_max_file_size)
+                            CreateThumbnailImages();
+                    }
+                    
                     if (duplicate_file_found) {
                         if (AddToDatabase()) {
-                            db_code = DatabaseUpdateCode::NewDuplicateAdded;
+                            db_code = MA::Database::FinishCode::NewDuplicateAdded;
                             getRecord();
                         }
                         else {
@@ -48,7 +61,7 @@ void MetaDatabaseWorker::addRecord()
                     }
                     else {
                         if (UpdateDatabase()) {
-                            db_code = DatabaseUpdateCode::Updated;
+                            db_code = MA::Database::FinishCode::Updated;
                             getRecord();
                         }
                         else {
@@ -57,17 +70,22 @@ void MetaDatabaseWorker::addRecord()
                     }
                 }
                 else {
-                    qDebug().nospace() << "This file already exist in the database and no update is required.";
-                    db_code = DatabaseUpdateCode::AlreadyExisted;
+                    //qDebug().nospace() << "This file already exist in the database and no update is required.";
+                    db_code = MA::Database::FinishCode::AlreadyExisted;
                     getRecord();
                 }
             }
             else {
                 media_type = BuildMetadataMaps();
-                qDebug().nospace() << "This '" << MediaItem::Type::print(media_type) << "' file will be added to database.";
+                //qDebug().nospace() << "This '" << MA::printType(media_type) << "' file will be added to database.";
+
+                if (media_type & MA::Type::Video and file_size < video_thumbnail_max_file_size)
+                    CreateThumbnailImages();
+                else if (media_type != MA::Type::Video and file_size < non_video_thumbnail_max_file_size)
+                    CreateThumbnailImages();
 
                 if (AddToDatabase()) {
-                    db_code = DatabaseUpdateCode::NewlyAdded;
+                    db_code = MA::Database::FinishCode::NewlyAdded;
                     getRecord();
                 }
                 else {
@@ -102,9 +120,9 @@ void MetaDatabaseWorker::getRecord()
 
             for (auto& table : DatabaseSchema::getAllTables(true)) {
                 
-                select = QString("SELECT * FROM \"%1\" WHERE \"%2\" = '%3'")
+                select = QString("SELECT * FROM \"%1\" WHERE \"%2\" = \"%3\"")
                     .arg(table)
-                    .arg(DatabaseSchema::Table::General::Field::Id)
+                    .arg(Field::General::Id)
                     .arg(file_id);
                 //qDebug() << select;
                 query.prepare(select);
@@ -122,14 +140,14 @@ void MetaDatabaseWorker::getRecord()
                         track_num++;
                         /*/
                         for (int i = 0; i < record.count(); i++) {
-                            if (record.fieldName(i) == MA::General::Field::ThumbnailData) continue;
+                            if (record.fieldName(i) == Field::General::ThumbnailData) continue;
                             qDebug().nospace() << ">>" << table_str << " (" << record.count() << ") :: " << record.fieldName(i) << " : " << record.value(i);
                         }//*/
                     }
                 }
                 else {
-                    qDebug() << "ERROR: Query Failed:" << query.lastError();
-                    qDebug() << "ERROR:" << query.lastQuery();
+                    qWarning() << "ERROR: Query Failed:" << query.lastError();
+                    qWarning() << "ERROR:" << query.lastQuery();
                 }
                 query.finish();
             }
@@ -209,27 +227,33 @@ bool MetaDatabaseWorker::OpenDatabase()
 bool MetaDatabaseWorker::ExistsInDatabase(QString table)
 {
     bool exists = false;
-    QString select = QString("SELECT * FROM \"%1\" WHERE \"%2\"='%3'")
+    QString select = QString("SELECT * FROM \"%1\" WHERE \"%2\" = \"%3\"")
         .arg(table)
-        .arg(MA::General::Field::Id)
+        .arg(Field::General::Id)
         .arg(file_id);
 
-    qDebug() << "ExistsInDatabase():" << select;
+    //qDebug() << "ExistsInDatabase():" << select;
     QSqlQuery query(select, database);
 
     if (query.exec()) {
-        if (table == MA::General::Title) {
+        if (table == Table::General) {
             while (query.next()) {
                 exists = true;
-                if (query.record().value(MA::General::Field::FilePath).toString() == file_path_str) {
+                if (query.record().value(Field::General::FilePath).toString() == file_path_str) {
+                    media_filters = MA::Type(query.record().value(Field::General::MediaStreams).toInt());
+                    media_type = MA::Type(query.record().value(Field::General::MediaType).toInt());
+                    if (query.record().contains(Field::Graphic::FrameCount) and query.record().value(Field::Graphic::FrameCount).isValid())
+                        frame_count = MA::Type(query.record().value(Field::Graphic::FrameCount).toInt());
                     duplicate_file_found = false;
                     break;
                 }
-                if (query.record().value(MA::General::Field::FilePath).toString() != file_path_str) {
+                if (query.record().value(Field::General::FilePath).toString() != file_path_str) {
                     // TODO: Update other tables, or skip? user setting?
                     duplicate_file_found = true;
-                    media_filters = MediaItem::Type::Filter(query.record().value(MA::General::Field::MediaStreams).toInt());
-                    media_type = MediaItem::Type::Filter(query.record().value(MA::General::Field::MediaType).toInt());
+                    media_filters = MA::Type(query.record().value(Field::General::MediaStreams).toInt());
+                    media_type = MA::Type(query.record().value(Field::General::MediaType).toInt());
+                    if (query.record().contains(Field::Graphic::FrameCount) and query.record().value(Field::Graphic::FrameCount).isValid())
+                        frame_count = MA::Type(query.record().value(Field::Graphic::FrameCount).toInt());
                 }
             }
         }
@@ -246,29 +270,32 @@ bool MetaDatabaseWorker::ExistsInDatabase(QString table)
         //}
     }
     else {
-        qDebug() << "ERROR: Query Failed:" << query.lastError();
+        qWarning() << "ERROR: Failed Exists In Database Query:" << query.lastError();
+        qWarning() << "ERROR: The Failed Query:" << query.lastQuery();
     }
 
     // If update_metadata already true, don't change.
-    update_metadata = (update_metadata) ? update_metadata : duplicate_file_found;
+    //update_metadata = (update_metadata) ? update_metadata : duplicate_file_found;
+    if ((MA::Update::Metadata & update_filter) == 0 and duplicate_file_found)
+        update_filter |= MA::Update::Metadata;
 
     query.finish();
     return exists;
 }
 
-MediaItem::Type::Filter MetaDatabaseWorker::BuildMetadataMaps()
+MA::Type MetaDatabaseWorker::BuildMetadataMaps()
 {
     // Using MediaInfoDLL get all metadata from file.
     MediaInfoDLL::MediaInfo media_info_file;
     size_t media_file = media_info_file.Open(file_path);
     //qDebug() << "Summarized Raw Data -> " << media_info_file.Inform();
     if (not media_info_file.IsReady()) {
-        return MediaItem::Type::Unknown;
+        return MA::Type::Unknown;
     }
     for (int stream_type = 0; stream_type < MediaInfoDLL::stream_t::Stream_Max; stream_type++) {
         MediaInfoDLL::stream_t stream_kind = static_cast<MediaInfoDLL::stream_t>(stream_type);
         int stream_count = QVariant(QString::fromStdWString(media_info_file.Get(stream_kind, 0, 2, MediaInfoDLL::Info_Text).c_str())).toInt();
-        qDebug() << "Stream Kind:" << MEDIA_INFO::print(stream_kind) << "| Streams/Tracks:" << stream_count;
+        //qDebug() << "Stream Kind:" << MEDIA_INFO::print(stream_kind) << "| Streams/Tracks:" << stream_count;
         
         if (duplicate_file_found and stream_kind != MediaInfoDLL::stream_t::Stream_General)
             continue;
@@ -278,6 +305,15 @@ MediaItem::Type::Filter MetaDatabaseWorker::BuildMetadataMaps()
             int param_alt_index = 0;
             int preferred_param_alt = 0;
             std::wstring last_param;
+
+
+
+            // Add "additional database field" that distinguishes between video and image streams/types in Graphic's table.
+            if (stream_kind == MediaInfoDLL::stream_t::Stream_Video or stream_kind == MediaInfoDLL::stream_t::Stream_Image) {
+                MA::Type stream_type = MA::MediaTypes::fromMediaInfoStreamKind(stream_kind);
+                PlaceKeyValuePairIntoCorrectMap({ Field::Graphic::Type, stream_type }, stream_kind, stream);
+            }
+
             
             for (int p = 0; p < param_count; p++) {
                 //QString param = QString::fromStdWString(media_info_file.Get(stream_kind, 2, p, MediaInfoDLL::Info_Name).c_str()); // Blank?
@@ -287,7 +323,7 @@ MediaItem::Type::Filter MetaDatabaseWorker::BuildMetadataMaps()
                 QString extra = QString::fromStdWString(media_info_file.Get(stream_kind, stream, p, MediaInfoDLL::Info_Measure_Text).c_str()); // Are the measurements needed or can they just be assumed? Usually storing the lowest unit of measurement.
                 bool successfully_placed = false;
                 if (value.length()) {
-                    qDebug().noquote().nospace() << "[" << MEDIA_INFO::print(stream_kind) << "-" << p << "]" << info << " - " << param << ": \"" << value << "\"" << extra;
+                    //qDebug().noquote().nospace() << "[" << MEDIA_INFO::print(stream_kind) << "-" << p << "]" << info << " - " << param << ": \"" << value << "\"" << extra;
                     if (last_param == param) {
                         param_alt_index++;
                     }
@@ -310,25 +346,26 @@ MediaItem::Type::Filter MetaDatabaseWorker::BuildMetadataMaps()
     }
 
     // Move music metadata from general_metadata to music_metadata.
-    /*for (auto& field : DatabaseSchema::Table::Music::Field::getAllFields()) {
+    /*for (auto& field : Field::Music::getAllFields()) {
         if (general_metadata->contains(field)) {
             music_metadata->insert(general_metadata->extract(field));
         }
     }*/
 
     // Get media type and filter based on metadata gathered. 
-    if (media_filters == MediaItem::Type::Unknown) { // Skips on duplicate_file_found
+    //if (media_filters == MA::Type::Unknown) { // Skips on duplicate_file_found
+    if (not duplicate_file_found) {
         if (general_metadata_maps.size())
-            media_filters = MediaItem::Type::Other;
+            media_filters = MA::Type::Other;
         if (video_metadata_maps.size())
-            media_filters |= MediaItem::Type::Video;
+            media_filters |= MA::Type::Video;
         if (audio_metadata_maps.size())
-            media_filters |= MediaItem::Type::Audio;
+            media_filters |= MA::Type::Audio;
         if (music_metadata_maps.size())
-            media_filters |= MediaItem::Type::Music;
+            media_filters |= MA::Type::Music;
         if (image_metadata_maps.size())
-            media_filters |= MediaItem::Type::Image;
-        media_type = MediaItem::Type::getTypeFromFilter(media_filters);
+            media_filters |= MA::Type::Image;
+        media_type = MA::getTypeFromFilter(media_filters);
     }
 
 
@@ -374,28 +411,24 @@ MediaItem::Type::Filter MetaDatabaseWorker::BuildMetadataMaps()
     }
     QString target_path_str = QString::fromStdString(target_path.string());
 
+    // Add key value pairs to metadata maps not included in media info. Thumbnail data/path added in CreateThumbnailImages()
+    AddAdditionalDatabaseFields(general_metadata_maps, Field::General::Id, file_id);
+    //AddAdditionalDatabaseFields(general_metadata_maps.at(0).get(), Field::General::Id, file_id);
+    AddAdditionalDatabaseFields(general_metadata_maps, Field::General::MediaType, media_type);
+    AddAdditionalDatabaseFields(general_metadata_maps, Field::General::MediaStreams, media_filters);
+    AddAdditionalDatabaseFields(general_metadata_maps, Field::General::FileSize, file_size, false);
+    AddAdditionalDatabaseFields(general_metadata_maps, Field::General::FileCreated, file_date_created, false);
+    AddAdditionalDatabaseFields(general_metadata_maps, Field::General::FileLastMod, file_date_modified, false);
+    //AddAdditionalDatabaseFields(general_metadata_maps, Field::General::FileReadOnly, file_read_only);
+    //AddAdditionalDatabaseFields(general_metadata_maps, Field::General::FileHidden, file_hidden);
+    AddAdditionalDatabaseFields(general_metadata_maps, Field::General::FileAttributes, static_cast<long long>(attributes));
+    AddAdditionalDatabaseFields(general_metadata_maps, Field::General::FileTargetPath, target_path_str);
     if (not duplicate_file_found) {
-        // Get thumbnail data and/or paths.
-        CreateThumbnailImages();
-
-        // Add key value pairs to metadata maps not included in media info. ThumbnailData will be added in database insert query.
-        AddAdditionalDatabaseFields(video_metadata_maps, DatabaseSchema::Table::Graphic::Field::Id, file_id);
-        AddAdditionalDatabaseFields(audio_metadata_maps, DatabaseSchema::Table::Audio::Field::Id, file_id);
-        AddAdditionalDatabaseFields(music_metadata_maps, DatabaseSchema::Table::Music::Field::Id, file_id);
-        AddAdditionalDatabaseFields(image_metadata_maps, DatabaseSchema::Table::Music::Field::Id, file_id);
-        AddAdditionalDatabaseFields(general_metadata_maps, DatabaseSchema::Table::General::Field::ThumbnailData, ":thumbnail");
-        AddAdditionalDatabaseFields(general_metadata_maps, DatabaseSchema::Table::General::Field::ThumbnailPath, thumbnail_path); // TODO: still get this even if duplicate?
+        AddAdditionalDatabaseFields(video_metadata_maps, Field::Graphic::Id, file_id);
+        AddAdditionalDatabaseFields(audio_metadata_maps, Field::Audio::Id, file_id);
+        AddAdditionalDatabaseFields(music_metadata_maps, Field::Music::Id, file_id);
+        AddAdditionalDatabaseFields(image_metadata_maps, Field::Music::Id, file_id);
     }
-    AddAdditionalDatabaseFields(general_metadata_maps, DatabaseSchema::Table::General::Field::Id, file_id);
-    //AddAdditionalDatabaseFields(general_metadata_maps.at(0).get(), DatabaseSchema::Table::General::Field::Id, file_id);
-    AddAdditionalDatabaseFields(general_metadata_maps, DatabaseSchema::Table::General::Field::MediaType, media_type);
-    AddAdditionalDatabaseFields(general_metadata_maps, DatabaseSchema::Table::General::Field::MediaStreams, media_filters);
-    AddAdditionalDatabaseFields(general_metadata_maps, DatabaseSchema::Table::General::Field::FileSize, file_size, false);
-    AddAdditionalDatabaseFields(general_metadata_maps, DatabaseSchema::Table::General::Field::FileCreated, file_date_created, false);
-    AddAdditionalDatabaseFields(general_metadata_maps, DatabaseSchema::Table::General::Field::FileLastMod, file_date_modified, false);
-    AddAdditionalDatabaseFields(general_metadata_maps, DatabaseSchema::Table::General::Field::FileReadOnly, file_read_only);
-    AddAdditionalDatabaseFields(general_metadata_maps, DatabaseSchema::Table::General::Field::FileHidden, file_hidden);
-    AddAdditionalDatabaseFields(general_metadata_maps, DatabaseSchema::Table::General::Field::FileTargetPath, target_path_str);
 
     /*/ Print Out... GENERAL
     for (const auto& m : general_metadata_maps) {
@@ -447,423 +480,423 @@ QVariant MetaDatabaseWorker::SterilizeValue(std::wstring value)
 MetaDatabaseWorker::KeyValuePair MetaDatabaseWorker::GetProperKeyAndValue(std::wstring key, std::wstring value, MediaInfoDLL::stream_t stream_kind)
 {
     QString new_key = "";
-    QVariant new_val = SterilizeValue(value); // TODO: skip converting this to QString, if it's just going to end up a number?
+    QVariant new_val = SterilizeValue(value);
 
     if (MediaInfoDLL::stream_t::Stream_General == stream_kind) {
         if (key == MEDIA_INFO::GENERAL::ALBUM) { // Music Table
-            new_key = DatabaseSchema::Table::Music::Field::Album;
+            new_key = Field::Music::Album;
         }
         else if (key == MEDIA_INFO::GENERAL::ALBUM_PERFORMER) { // Music Table
-            new_key = DatabaseSchema::Table::Music::Field::AlbumPerformer;
+            new_key = Field::Music::AlbumPerformer;
         }
         else if (key == MEDIA_INFO::GENERAL::ALBUM_REPLAY_GAIN) { // Music Table
-            new_key = DatabaseSchema::Table::Music::Field::AlbumReplayGain;
+            new_key = Field::Music::AlbumReplayGain;
         }
         else if (key == MEDIA_INFO::GENERAL::ALBUM_REPLAY_GAIN_PEAK) { // Music Table
-            new_key = DatabaseSchema::Table::Music::Field::AlbumReplayGainPeak;
+            new_key = Field::Music::AlbumReplayGainPeak;
         }
         else if (key == MEDIA_INFO::GENERAL::AUDIO_LANGUAGE_LIST) { // Table???
-            new_key = DatabaseSchema::Table::General::Field::AudioLanguageList;
+            new_key = Field::General::AudioLanguageList;
         }
         else if (key == MEDIA_INFO::GENERAL::CODEC_ID) {
-            new_key = DatabaseSchema::Table::General::Field::CodecId;
+            new_key = Field::General::CodecId;
         }
         else if (key == MEDIA_INFO::GENERAL::COMMENT) { // Music Table
-            new_key = DatabaseSchema::Table::Music::Field::Comment;
+            new_key = Field::Music::Comment;
         }
         else if (key == MEDIA_INFO::GENERAL::COMMON_FORMATS) {
-            new_key = DatabaseSchema::Table::General::Field::CommonFormats;
+            new_key = Field::General::CommonFormats;
         }
         else if (key == MEDIA_INFO::GENERAL::COMPILATION) { // Music Table
-            new_key = DatabaseSchema::Table::Music::Field::Compilation;
+            new_key = Field::Music::Compilation;
         }
         else if (key == MEDIA_INFO::GENERAL::COPYRIGHT) { // Music Table
-            new_key = DatabaseSchema::Table::Music::Field::Copyright;
+            new_key = Field::Music::Copyright;
         }
         /*else if (key == MEDIA_INFO::GENERAL::COVER) { // Music Table
-            new_key = DatabaseSchema::Table::Music::Field:;
+            new_key = Field::Music:;
         }*/
         /*else if (key == MEDIA_INFO::GENERAL::COVER_MIME) { // Music Table
-            new_key = DatabaseSchema::Table::Music::Field:;
+            new_key = Field::Music:;
         }*/
         /*else if (key == MEDIA_INFO::GENERAL::COVER_TYPE) { // Music Table
-            new_key = DatabaseSchema::Table::Music::Field:;
+            new_key = Field::Music:;
         }*/
         else if (key == MEDIA_INFO::GENERAL::DURATION) {
-            new_key = DatabaseSchema::Table::General::Field::Duration;
+            new_key = Field::General::Duration;
             new_val = new_val.toLongLong();
         }
         /*else if (key == MEDIA_INFO::GENERAL::ENCODED_BY) { // Music Table
-            new_key = DatabaseSchema::Table::General::Field:;
+            new_key = Field::General:;
         }*/
         else if (key == MEDIA_INFO::GENERAL::ENCODED_DATE) {
-            new_key = DatabaseSchema::Table::General::Field::EncodedDate;
+            new_key = Field::General::EncodedDate;
             new_val = dateTimeStringToSeconds(new_val.toString());
         }
         else if (key == MEDIA_INFO::GENERAL::FILE_CREATION_DATE) {
-            new_key = DatabaseSchema::Table::General::Field::FileCreated;
+            new_key = Field::General::FileCreated;
             new_val = dateTimeStringToSeconds(new_val.toString());
         }
         else if (key == MEDIA_INFO::GENERAL::FILE_LAST_MOD_DATE) {
-            new_key = DatabaseSchema::Table::General::Field::FileLastMod;
+            new_key = Field::General::FileLastMod;
             new_val = dateTimeStringToSeconds(new_val.toString());
         }
         else if (key == MEDIA_INFO::GENERAL::FILE_PATH) {
-            new_key = DatabaseSchema::Table::General::Field::FilePath;
+            new_key = Field::General::FilePath;
             //new_val = file_path_str;
             new_val = SterilizeValue(file_path_str.toStdWString());
         }
         /*else if (key == MEDIA_INFO::GENERAL::FILE_SIZE) { // Added later with a number in bytes
-            new_key = DatabaseSchema::Table::General::Field::FileSize;
+            new_key = Field::General::FileSize;
         }*/
         else if (key == MEDIA_INFO::GENERAL::FORMAT) {
-            new_key = DatabaseSchema::Table::General::Field::Format;
+            new_key = Field::General::Format;
         }
         else if (key == MEDIA_INFO::GENERAL::FORMAT_PROFILE) { // Video Table
-            new_key = DatabaseSchema::Table::General::Field::FormatInfo;
+            new_key = Field::General::FormatInfo;
         }
         else if (key == MEDIA_INFO::GENERAL::FRAME_COUNT) {
-            new_key = DatabaseSchema::Table::General::Field::FrameCount;
+            new_key = Field::General::FrameCount;
             new_val = new_val.toLongLong();
         }
         else if (key == MEDIA_INFO::GENERAL::FRAME_RATE) {
-            new_key = DatabaseSchema::Table::General::Field::FrameRate;
+            new_key = Field::General::FrameRate;
             new_val = new_val.toDouble();
         }
         else if (key == MEDIA_INFO::GENERAL::GENRE) { // Music Table
-            new_key = DatabaseSchema::Table::Music::Field::Genre;
+            new_key = Field::Music::Genre;
         }
         else if (key == MEDIA_INFO::GENERAL::GROUPING) { // Music Table
-            new_key = DatabaseSchema::Table::Music::Field::Grouping;
+            new_key = Field::Music::Grouping;
         }
         else if (key == MEDIA_INFO::GENERAL::ISRC) { // Music Table
-            new_key = DatabaseSchema::Table::Music::Field::ISRC;
+            new_key = Field::Music::ISRC;
         }
         else if (key == MEDIA_INFO::GENERAL::LABEL) { // Music Table
-            new_key = DatabaseSchema::Table::Music::Field::Label; // <-------- TODO: label to publisher?
+            new_key = Field::Music::Label; // <-------- TODO: label to publisher?
         }
         else if (key == MEDIA_INFO::GENERAL::LYRICIST) { // Music Table
-            new_key = DatabaseSchema::Table::Music::Field::Lyricist;
+            new_key = Field::Music::Lyricist;
         }
         //else if (key == MEDIA_INFO::GENERAL::LYRICS) { // Music Table
-        //    new_key = DatabaseSchema::Table::Music::Field:;
+        //    new_key = Field::Music:;
         //}
         else if (key == MEDIA_INFO::GENERAL::MIME_TYPE) {
-            new_key = DatabaseSchema::Table::General::Field::MimeType;
+            new_key = Field::General::MimeType;
         }
         else if (key == MEDIA_INFO::GENERAL::OVERALL_BIT_RATE) {
-            new_key = DatabaseSchema::Table::General::Field::OverallBitRate;
+            new_key = Field::General::OverallBitRate;
             new_val = new_val.toInt();
         }
         else if (key == MEDIA_INFO::GENERAL::OVERALL_BIT_RATE_MODE) {
-            new_key = DatabaseSchema::Table::General::Field::OverallBitRateMode;
+            new_key = Field::General::OverallBitRateMode;
         }
         else if (key == MEDIA_INFO::GENERAL::OWNR) { // Music Table
-            new_key = DatabaseSchema::Table::Music::Field::Owner;
+            new_key = Field::Music::Owner;
         }
         //else if (key == MEDIA_INFO::GENERAL::PART) { // Music Table
-        //    new_key = DatabaseSchema::Table::Music::Field:;
+        //    new_key = Field::Music:;
         //}
         else if (key == MEDIA_INFO::GENERAL::PERFORMER) { // Music Table
-            new_key = DatabaseSchema::Table::Music::Field::Performer;
+            new_key = Field::Music::Performer;
         }
         else if (key == MEDIA_INFO::GENERAL::PERFORMER_URL) { // Music Table
-            new_key = DatabaseSchema::Table::Music::Field::AudioURL; // 3 in General (Music), Preferred Order: 2
+            new_key = Field::Music::AudioURL;
         }
         else if (key == MEDIA_INFO::GENERAL::PUBLISHER) { // Music Table
-            new_key = DatabaseSchema::Table::Music::Field::Publisher;
+            new_key = Field::Music::Publisher;
         }
         else if (key == MEDIA_INFO::GENERAL::RECORDED_DATE) { // Music Table
-            new_key = DatabaseSchema::Table::Music::Field::RecordedDate;
+            new_key = Field::Music::RecordedDate;
             new_val = new_val.toInt(); // This should just be the year, else treat it like DateTime
         }
         else if (key == MEDIA_INFO::GENERAL::RELEASE_COUNTRY) { // Music Table
-            new_key = DatabaseSchema::Table::Music::Field::ReleaseCountry;
+            new_key = Field::Music::ReleaseCountry;
         }
         else if (key == MEDIA_INFO::GENERAL::STREAMABLE) {
-            new_key = DatabaseSchema::Table::General::Field::Streamable;
+            new_key = Field::General::Streamable;
         }
         else if (key == MEDIA_INFO::GENERAL::STREAM_SIZE) {
-            new_key = DatabaseSchema::Table::General::Field::StreamSize;
+            new_key = Field::General::StreamSize;
             new_val = new_val.toLongLong();
         }
         else if (key == MEDIA_INFO::GENERAL::TAGGED_DATE) {
-            new_key = DatabaseSchema::Table::General::Field::TaggedDate;
+            new_key = Field::General::TaggedDate;
             new_val = dateTimeStringToSeconds(new_val.toString());
         }
         else if (key == MEDIA_INFO::GENERAL::TITLE) { // Music Table
-            new_key = DatabaseSchema::Table::Music::Field::Title;
+            new_key = Field::Music::Title;
         }
         else if (key == MEDIA_INFO::GENERAL::TRACK_NAME) { // Music Table
-            new_key = DatabaseSchema::Table::Music::Field::TrackName;
+            new_key = Field::Music::TrackName;
         }
         else if (key == MEDIA_INFO::GENERAL::TRACK_NUMBER) { // Music Table
-            new_key = DatabaseSchema::Table::Music::Field::TrackNumber;
+            new_key = Field::Music::TrackNumber;
             new_val = new_val.toInt();
         }
         else if (key == MEDIA_INFO::GENERAL::WEBPAGE) { // Music Table
-            new_key = DatabaseSchema::Table::Music::Field::AudioURL; // 3 in General (Music), Preferred Order: 3
+            new_key = Field::Music::AudioURL; // 3 in General (Music), Preferred Order: 3
         }
         else if (key == MEDIA_INFO::GENERAL::WEBPAGE_SOURCE) { // Music Table
-            new_key = DatabaseSchema::Table::Music::Field::AudioURL; // 3 in General (Music), Preferred Order: 4
+            new_key = Field::Music::AudioURL; // 3 in General (Music), Preferred Order: 4
         }
         /*else if (key == MEDIA_INFO::GENERAL::WRITING_LIBRARY) { // Music or Audio Table?
-            new_key = DatabaseSchema::Table::Audio::Field::WritingLibrary; // Not including, this should show up in Video or Audio anyways
+            new_key = Field::Audio::WritingLibrary; // Not including, this should show up in Video or Audio anyways
         }*/
     }
 
     if (MediaInfoDLL::stream_t::Stream_Video == stream_kind) {
         /*else if (key == MEDIA_INFO::VIDEO::BITS_PER_FRAME) { // This is just math using other metadata
-            new_key = DatabaseSchema::Table::Graphic::Field:;
+            new_key = Field::Graphic:;
         }*/
         if (key == MEDIA_INFO::VIDEO::BIT_DEPTH) {
-            new_key = DatabaseSchema::Table::Graphic::Field::BitDepth;
+            new_key = Field::Graphic::BitDepth;
             new_val = new_val.toInt();
         }
         else if (key == MEDIA_INFO::VIDEO::BIT_RATE) {
-            new_key = DatabaseSchema::Table::Graphic::Field::BitRate;
+            new_key = Field::Graphic::BitRate;
             new_val = new_val.toInt();
         }
         else if (key == MEDIA_INFO::VIDEO::CHROMA_SUBSAMPLING) {
-            new_key = DatabaseSchema::Table::Graphic::Field::ChromaSubsampling;
+            new_key = Field::Graphic::ChromaSubsampling;
         }
         else if (key == MEDIA_INFO::VIDEO::CODEC_ID) {
-            new_key = DatabaseSchema::Table::Graphic::Field::CodecId;
+            new_key = Field::Graphic::CodecId;
         }
         else if (key == MEDIA_INFO::VIDEO::CODEC_ID_INFO) {
-            new_key = DatabaseSchema::Table::Graphic::Field::CodecIdInfo;
+            new_key = Field::Graphic::CodecIdInfo;
         }
         /*else if (key == MEDIA_INFO::VIDEO::CODEX_CONFIG_BOX) {
-            new_key = DatabaseSchema::Table::Graphic::Field:;
+            new_key = Field::Graphic:;
         }*/
         else if (key == MEDIA_INFO::VIDEO::COLOR_PRIMARIES) {
-            new_key = DatabaseSchema::Table::Graphic::Field::ColorPrimaries;
+            new_key = Field::Graphic::ColorPrimaries;
         }
         else if (key == MEDIA_INFO::VIDEO::COLOR_RANGE) {
-            new_key = DatabaseSchema::Table::Graphic::Field::ColorRange;
+            new_key = Field::Graphic::ColorRange;
         }
         else if (key == MEDIA_INFO::VIDEO::COLOR_SPACE) {
-            new_key = DatabaseSchema::Table::Graphic::Field::ColorSpace;
+            new_key = Field::Graphic::ColorSpace;
         }
         else if (key == MEDIA_INFO::VIDEO::DISPLAY_ASPECT_RATIO) {
-            new_key = DatabaseSchema::Table::Graphic::Field::AspectRatio;
+            new_key = Field::Graphic::AspectRatio;
         }
         else if (key == MEDIA_INFO::VIDEO::DURATION) {
-            new_key = DatabaseSchema::Table::Graphic::Field::Duration;
+            new_key = Field::Graphic::Duration;
             new_val = new_val.toLongLong();
         }
         else if (key == MEDIA_INFO::VIDEO::ENCODED_DATE) {
-            new_key = DatabaseSchema::Table::Graphic::Field::EncodedDate;
+            new_key = Field::Graphic::EncodedDate;
             new_val = dateTimeStringToSeconds(new_val.toString());
         }
         else if (key == MEDIA_INFO::VIDEO::ENCODING_SETTINGS) {
-            new_key = DatabaseSchema::Table::Graphic::Field::EncodingSettings;
+            new_key = Field::Graphic::EncodingSettings;
         }
         else if (key == MEDIA_INFO::VIDEO::FORMAT) {
-            new_key = DatabaseSchema::Table::Graphic::Field::Format;
+            new_key = Field::Graphic::Format;
         }
         else if (key == MEDIA_INFO::VIDEO::FORMAT_INFO) {
-            new_key = DatabaseSchema::Table::Graphic::Field::FormatInfo;
+            new_key = Field::Graphic::FormatInfo;
         }
         else if (key == MEDIA_INFO::VIDEO::FORMAT_PROFILE) {
-            new_key = DatabaseSchema::Table::Graphic::Field::FormatProfile;
+            new_key = Field::Graphic::FormatProfile;
         }
         else if (key == MEDIA_INFO::VIDEO::FORMAT_SETTINGS) {
-            new_key = DatabaseSchema::Table::Graphic::Field::FormatSettings;
+            new_key = Field::Graphic::FormatSettings;
         }
         else if (key == MEDIA_INFO::VIDEO::FORMAT_URL) {
-            new_key = DatabaseSchema::Table::Graphic::Field::FormatURL;
+            new_key = Field::Graphic::FormatURL;
         }
         else if (key == MEDIA_INFO::VIDEO::FRAME_COUNT) {
-            new_key = DatabaseSchema::Table::Graphic::Field::FrameCount;
+            new_key = Field::Graphic::FrameCount;
             new_val = new_val.toLongLong();
         }
         else if (key == MEDIA_INFO::VIDEO::FRAME_RATE) {
-            new_key = DatabaseSchema::Table::Graphic::Field::FrameRate;
+            new_key = Field::Graphic::FrameRate;
             new_val = new_val.toDouble();
         }
         else if (key == MEDIA_INFO::VIDEO::FRAME_RATE_MODE) {
-            new_key = DatabaseSchema::Table::Graphic::Field::FrameRateMode;
+            new_key = Field::Graphic::FrameRateMode;
         }
         else if (key == MEDIA_INFO::VIDEO::HEIGHT) {
-            new_key = DatabaseSchema::Table::Graphic::Field::Height;
+            new_key = Field::Graphic::Height;
             new_val = new_val.toInt();
         }
         else if (key == MEDIA_INFO::VIDEO::ID) {
-            new_key = DatabaseSchema::Table::Graphic::Field::TrackId;
+            new_key = Field::Graphic::TrackId;
             new_val = new_val.toInt();
         }
         else if (key == MEDIA_INFO::VIDEO::LANGUAGE) {
-            new_key = DatabaseSchema::Table::Graphic::Field::Language;
+            new_key = Field::Graphic::Language;
         }
         else if (key == MEDIA_INFO::VIDEO::MATRIX_COEFFICIENTS) {
-            new_key = DatabaseSchema::Table::Graphic::Field::MatrixCoefficients;
+            new_key = Field::Graphic::MatrixCoefficients;
         }
         else if (key == MEDIA_INFO::VIDEO::ROTATION) {
-            new_key = DatabaseSchema::Table::Graphic::Field::Rotation;
+            new_key = Field::Graphic::Rotation;
             new_val = new_val.toDouble();
         }
         else if (key == MEDIA_INFO::VIDEO::SCAN_TYPE) {
-            new_key = DatabaseSchema::Table::Graphic::Field::ScanType;
+            new_key = Field::Graphic::ScanType;
         }
         else if (key == MEDIA_INFO::VIDEO::STREAM_SIZE) {
-            new_key = DatabaseSchema::Table::Graphic::Field::StreamSize;
+            new_key = Field::Graphic::StreamSize;
             new_val = new_val.toLongLong();
         }
         else if (key == MEDIA_INFO::VIDEO::TAGGED_DATE) {
-            new_key = DatabaseSchema::Table::Graphic::Field::TaggedDate;
+            new_key = Field::Graphic::TaggedDate;
             new_val = dateTimeStringToSeconds(new_val.toString());
         }
         else if (key == MEDIA_INFO::VIDEO::TITLE) {
-            new_key = DatabaseSchema::Table::Graphic::Field::Title;
+            new_key = Field::Graphic::Title;
         }
         else if (key == MEDIA_INFO::VIDEO::WIDTH) {
-            new_key = DatabaseSchema::Table::Graphic::Field::Width;
+            new_key = Field::Graphic::Width;
             new_val = new_val.toInt();
         }
         else if (key == MEDIA_INFO::VIDEO::WRITING_LIBRARY) {
-            new_key = DatabaseSchema::Table::Graphic::Field::WritingLibrary;
+            new_key = Field::Graphic::WritingLibrary;
         }
     }
 
     if (MediaInfoDLL::stream_t::Stream_Audio == stream_kind) {
-        /*if (key == MEDIA_INFO::AUDIO::ALTERNATE_GROUP) { // Track Id??
-            new_key = DatabaseSchema::Table::Audio::Field:;
+        /*if (key == MEDIA_INFO::AUDIO::ALTERNATE_GROUP) {
+            new_key = Field::Audio:;
         }*/
         if (key == MEDIA_INFO::AUDIO::BIT_RATE) {
-            new_key = DatabaseSchema::Table::Audio::Field::BitRate;
+            new_key = Field::Audio::BitRate;
             new_val = new_val.toInt();
         }
         else if (key == MEDIA_INFO::AUDIO::BIT_RATE_MODE) {
-            new_key = DatabaseSchema::Table::Audio::Field::BitRateMode;
+            new_key = Field::Audio::BitRateMode;
         }
         else if (key == MEDIA_INFO::AUDIO::CHANNELS) {
-            new_key = DatabaseSchema::Table::Audio::Field::Channels;
+            new_key = Field::Audio::Channels;
             new_val = new_val.toInt();
         }
         else if (key == MEDIA_INFO::AUDIO::CHANNELS_LAYOUT) {
-            new_key = DatabaseSchema::Table::Audio::Field::ChannelLayout;
+            new_key = Field::Audio::ChannelLayout;
         }
         else if (key == MEDIA_INFO::AUDIO::CHANNEL_POSITIONS) {
-            new_key = DatabaseSchema::Table::Audio::Field::ChannelPositions;
+            new_key = Field::Audio::ChannelPositions;
         }
         else if (key == MEDIA_INFO::AUDIO::CODEC_ID) {
-            new_key = DatabaseSchema::Table::Audio::Field::CodecId;
+            new_key = Field::Audio::CodecId;
         }
         else if (key == MEDIA_INFO::AUDIO::COMPRESSION_MODE) {
-            new_key = DatabaseSchema::Table::Audio::Field::CompressionMode;
+            new_key = Field::Audio::CompressionMode;
         }
-        //else if (key == MEDIA_INFO::AUDIO::DEFAULT) {                          // TODO: Is this default track? "TrackId" field?
-        //    new_key = DatabaseSchema::Table::Audio::Field:;
+        //else if (key == MEDIA_INFO::AUDIO::DEFAULT) {     // TODO: Is this default track? "TrackId" field?
+        //    new_key = Field::Audio:;
         //}
         else if (key == MEDIA_INFO::AUDIO::DURATION) {
-            new_key = DatabaseSchema::Table::Audio::Field::Duration;
+            new_key = Field::Audio::Duration;
             new_val = new_val.toLongLong();
         }
         else if (key == MEDIA_INFO::AUDIO::ENCODED_DATE) {
-            new_key = DatabaseSchema::Table::Audio::Field::EncodedDate;
+            new_key = Field::Audio::EncodedDate;
             new_val = dateTimeStringToSeconds(new_val.toString());
         }
         else if (key == MEDIA_INFO::AUDIO::FORMAT) {
-            new_key = DatabaseSchema::Table::Audio::Field::Format;
+            new_key = Field::Audio::Format;
         }
         else if (key == MEDIA_INFO::AUDIO::FORMAT_INFO) {
-            new_key = DatabaseSchema::Table::Audio::Field::FormatInfo;
+            new_key = Field::Audio::FormatInfo;
         }
         else if (key == MEDIA_INFO::AUDIO::FORMAT_PROFILE) {
-            new_key = DatabaseSchema::Table::Audio::Field::FormatProfile;
+            new_key = Field::Audio::FormatProfile;
         }
         else if (key == MEDIA_INFO::AUDIO::FORMAT_SETTINGS) {
-            new_key = DatabaseSchema::Table::Audio::Field::FormatSettings;
+            new_key = Field::Audio::FormatSettings;
         }
         /*else if (key == MEDIA_INFO::AUDIO::FORMAT_VERSION) {
-            new_key = DatabaseSchema::Table::Audio::Field:;
+            new_key = Field::Audio:;
         }*/
         else if (key == MEDIA_INFO::AUDIO::FRAME_COUNT) {
-            new_key = DatabaseSchema::Table::Audio::Field::FrameCount;
+            new_key = Field::Audio::FrameCount;
             new_val = new_val.toLongLong();
         }
         else if (key == MEDIA_INFO::AUDIO::FRAME_RATE) {
-            new_key = DatabaseSchema::Table::Audio::Field::FrameRate;
+            new_key = Field::Audio::FrameRate;
             //new_val = stringToNumber(new_val.toString());
             new_val = new_val.toDouble();
         }
         else if (key == MEDIA_INFO::AUDIO::ID) {
-            new_key = DatabaseSchema::Table::Audio::Field::TrackId;
+            new_key = Field::Audio::TrackId;
             new_val = new_val.toDouble();
         }
         else if (key == MEDIA_INFO::AUDIO::LANGUAGE) {
-            new_key = DatabaseSchema::Table::Audio::Field::Language;
+            new_key = Field::Audio::Language;
         }
         else if (key == MEDIA_INFO::AUDIO::MAX_BIT_RATE) {
-            new_key = DatabaseSchema::Table::Audio::Field::BitRate;
+            new_key = Field::Audio::BitRate;
             new_val = new_val.toInt();
         }
         /*else if (key == MEDIA_INFO::AUDIO::MD5) {
-            new_key = DatabaseSchema::Table::Audio::Field:; // Id?
+            new_key = Field::Audio:; // Id?
         }*/
         else if (key == MEDIA_INFO::AUDIO::REPLAY_GAIN) {
-            new_key = DatabaseSchema::Table::Audio::Field::ReplayGain;
+            new_key = Field::Audio::ReplayGain;
             new_val = new_val.toDouble();
         }
         else if (key == MEDIA_INFO::AUDIO::REPLAY_GAIN_PEAK) {
-            new_key = DatabaseSchema::Table::Audio::Field::ReplayGainPeak;
+            new_key = Field::Audio::ReplayGainPeak;
             new_val = new_val.toDouble();
         }
         else if (key == MEDIA_INFO::AUDIO::SAMPLING_COUNT) {
-            new_key = DatabaseSchema::Table::Audio::Field::SamplingCount;
+            new_key = Field::Audio::SamplingCount;
             new_val = new_val.toInt();
         }
         else if (key == MEDIA_INFO::AUDIO::SAMPLING_RATE) {
-            new_key = DatabaseSchema::Table::Audio::Field::SamplingRate;
+            new_key = Field::Audio::SamplingRate;
             new_val = new_val.toInt();
         }
         else if (key == MEDIA_INFO::AUDIO::STREAM_SIZE) {
-            new_key = DatabaseSchema::Table::Audio::Field::StreamSize;
+            new_key = Field::Audio::StreamSize;
             new_val = new_val.toLongLong();
         }
         else if (key == MEDIA_INFO::AUDIO::TAGGED_DATE) {
-            new_key = DatabaseSchema::Table::Audio::Field::TaggedDate;
+            new_key = Field::Audio::TaggedDate;
             new_val = dateTimeStringToSeconds(new_val.toString());
         }
         else if (key == MEDIA_INFO::AUDIO::TITLE) {
-            new_key = DatabaseSchema::Table::Audio::Field::Title;
+            new_key = Field::Audio::Title;
         }
         else if (key == MEDIA_INFO::AUDIO::WRITING_LIBRARY) {
-            new_key = DatabaseSchema::Table::Audio::Field::WritingLibrary;
+            new_key = Field::Audio::WritingLibrary;
         }
     }
 
     if (MediaInfoDLL::stream_t::Stream_Image == stream_kind) {
         if (key == MEDIA_INFO::IMAGE::BIT_DEPTH) {
-            new_key = DatabaseSchema::Table::Graphic::Field::BitDepth;
+            new_key = Field::Graphic::BitDepth;
             new_val = new_val.toInt();
         }
         else if (key == MEDIA_INFO::IMAGE::CHROMA_SUBSAMPLING) {
-            new_key = DatabaseSchema::Table::Graphic::Field::ChromaSubsampling;
+            new_key = Field::Graphic::ChromaSubsampling;
         }
         else if (key == MEDIA_INFO::IMAGE::COLOR_SPACE) {
-            new_key = DatabaseSchema::Table::Graphic::Field::ColorSpace;
+            new_key = Field::Graphic::ColorSpace;
         }
         else if (key == MEDIA_INFO::IMAGE::COLOR_SPACE_ICC) {
-            new_key = DatabaseSchema::Table::Graphic::Field::ColorSpaceICC;
+            new_key = Field::Graphic::ColorSpaceICC;
         }
         else if (key == MEDIA_INFO::IMAGE::COMPRESSION_MODE) {
-            new_key = DatabaseSchema::Table::Graphic::Field::CompressionMode;
+            new_key = Field::Graphic::CompressionMode;
         }
         else if (key == MEDIA_INFO::IMAGE::FORMAT) {
-            new_key = DatabaseSchema::Table::Graphic::Field::Format;
+            new_key = Field::Graphic::Format;
         }
         else if (key == MEDIA_INFO::IMAGE::HEIGHT) {
-            new_key = DatabaseSchema::Table::Graphic::Field::Height;
+            new_key = Field::Graphic::Height;
             new_val = new_val.toInt();
         }
         else if (key == MEDIA_INFO::IMAGE::STREAM_SIZE) {
-            new_key = DatabaseSchema::Table::Graphic::Field::StreamSize;
+            new_key = Field::Graphic::StreamSize;
             new_val = new_val.toLongLong();
         }
         else if (key == MEDIA_INFO::IMAGE::WIDTH) {
-            new_key = DatabaseSchema::Table::Graphic::Field::Width;
+            new_key = Field::Graphic::Width;
             new_val = new_val.toInt();
         }
     }
@@ -881,7 +914,7 @@ bool MetaDatabaseWorker::PlaceKeyValuePairIntoCorrectMap(KeyValuePair key_value_
 {
     bool success = true;
     if (MediaInfoDLL::Stream_General == stream_kind) {
-        if (DatabaseSchema::Table::Music::Field::doesFieldExist(key_value_pair.key)) {
+        if (Field::Music::doesFieldExist(key_value_pair.key)) {
             // Moving: General -> Music
             if (stream >= music_metadata_maps.size()) {
                 music_metadata_maps.push_back(std::make_unique<std::map<QString, QVariant>>());
@@ -1016,20 +1049,24 @@ HRESULT MetaDatabaseWorker::resolveWindowsLink(HWND hwnd, LPCSTR lpszLinkFile, L
 
 void MetaDatabaseWorker::CreateThumbnailImages()
 {
-    if (media_filters & (MediaItem::Type::Video | MediaItem::Type::Image | MediaItem::Type::Music)) {
+    // Note: Don't create and save more of the same thumbnail if dupe, but still get any different thumbnail paths. (TODO: use correct path and fall back to oringal dupe thumbnail path if not found)
+    if ((MA::Type::Video | MA::Type::Image | MA::Type::Music) & media_filters and not duplicate_file_found) {
     
         //int duration;
-        int frame_count;
         int thumbnail_count;
         int frame_interval;
         int skip_frames_above;
 
-        if (media_filters & MediaItem::Type::Video) {
+        if (media_filters & MA::Type::Video) {
             // TODO: Backup/Alt: do some math and get maximum frames in video, use it to set frame_interval.
             //       If frames not in metadata, get duration and frame rate. else guess based on file size.  duration / 30 FPS?
             //       Even if FPS is wrong it should get close to the right number of thumbnails spread across the video.
-            //duration = general_metadata_maps.at(0)->at(DatabaseSchema::Table::General::Field::Duration).toInt();
-            frame_count = general_metadata_maps.at(0)->at(DatabaseSchema::Table::Graphic::Field::FrameCount).toInt();
+            //duration = general_metadata_maps.at(0)->at(Field::General::Duration).toInt();
+            if (general_metadata_maps.at(0)->contains(Field::Graphic::FrameCount) and general_metadata_maps.at(0)->at(Field::Graphic::FrameCount).isValid())
+                frame_count = general_metadata_maps.at(0)->at(Field::Graphic::FrameCount).toInt();
+            else if (frame_count == 0) {
+                qWarning() << "WARNING: Missing frame_count, need alt why to create 'frame_interval'";
+            }
             thumbnail_count = 8; // TODO: user setting
             frame_interval = frame_count / (thumbnail_count + 1);
             skip_frames_above = frame_count - frame_interval;
@@ -1102,17 +1139,19 @@ void MetaDatabaseWorker::CreateThumbnailImages()
             // TODO: compressing doesn't seem to decrease size in DB, maybe try using a different image format if size becomes a problem 
             // Saved JPEG images should be about 6 kb each, but when saving 8 images (pixmap) to the DB it's adding an extra ~340kb
             thumbnail_images.clear();
+
+            AddAdditionalDatabaseFields(general_metadata_maps, Field::General::ThumbnailData, ":thumbnail");
         }
         else {
             thumbnail_data = 0;
         }
     }
 
-    if (media_type & MediaItem::Type::Image) {
+    if (media_type & MA::Type::Image) {
         thumbnail_path = QString::fromStdString(file_path.string());
     }
     // TODO: Always look for image on disk to use for thumbnail or only when none created/found from file?  user setting?  thumbnail_data.isEmpty() 
-    else if (media_type > MediaItem::Type::Other) {
+    else if (media_type > MA::Type::Other) {
         // Search in the file's current and parent directory for files named: folder, cover, front, etc and extensions jpg, png, etc.
         std::filesystem::path thumbnail_link;
         for (auto const& dir_entry : std::filesystem::recursive_directory_iterator{ file_path.parent_path(), std::filesystem::directory_options::skip_permission_denied }) {
@@ -1140,10 +1179,13 @@ void MetaDatabaseWorker::CreateThumbnailImages()
             }
         }
         if (std::filesystem::exists(thumbnail_link)) {
-            qDebug() << "Found Music Thumbnail:" << thumbnail_link.string();
+            //qDebug() << "Found Music Thumbnail:" << thumbnail_link.string();
             thumbnail_path = QString::fromStdString(thumbnail_link.string());
+            AddAdditionalDatabaseFields(general_metadata_maps, Field::General::ThumbnailPath, thumbnail_path);
         }
     }
+    AddAdditionalDatabaseFields(general_metadata_maps, Field::General::Id, file_id, false);
+    AddAdditionalDatabaseFields(general_metadata_maps, Field::General::FilePath, file_path_str, false);
 }
 
 int MetaDatabaseWorker::LoadInAVContexts(const char* file_path_char, int force_jpeg_codec_for_embedded_stream, bool embedded_file_saved)
@@ -1154,7 +1196,7 @@ int MetaDatabaseWorker::LoadInAVContexts(const char* file_path_char, int force_j
     fmt_ctx = avformat_alloc_context();
 
     if ((return_value = avformat_open_input(&fmt_ctx, file_path_char, NULL, NULL)) < 0) {
-        qDebug() << "ERROR: failed to open input file";
+        qWarning() << "ERROR: failed to open input file";
         return return_value;
     }
 
@@ -1164,7 +1206,7 @@ int MetaDatabaseWorker::LoadInAVContexts(const char* file_path_char, int force_j
     }
 
     if ((return_value = avformat_find_stream_info(fmt_ctx, NULL)) < 0) {
-        qDebug() << "ERROR: failed to find stream information";
+        qWarning() << "ERROR: failed to find stream information";
         return return_value;
     }
     
@@ -1185,7 +1227,7 @@ int MetaDatabaseWorker::LoadInAVContexts(const char* file_path_char, int force_j
 
     return_value = av_find_best_stream(fmt_ctx, AVMediaType::AVMEDIA_TYPE_VIDEO, -1, -1, &dec, 0);
     if (return_value < 0) {
-        qDebug() << "ERROR: failed to find a video stream in the input file";
+        qWarning() << "ERROR: failed to find a video stream in the input file";
         return return_value;
     }
     video_stream_index = return_value;
@@ -1231,7 +1273,7 @@ int MetaDatabaseWorker::LoadInAVContexts(const char* file_path_char, int force_j
     
     dec_ctx = avcodec_alloc_context3(dec);
     if (!dec_ctx) {
-        qDebug() << "ERROR: failed to allocate decoding context/memory";
+        qWarning() << "ERROR: failed to allocate decoding context/memory";
         return AVERROR(ENOMEM);
     }
 
@@ -1239,7 +1281,7 @@ int MetaDatabaseWorker::LoadInAVContexts(const char* file_path_char, int force_j
 
     // Initiate the video decoder
     if ((return_value = avcodec_open2(dec_ctx, dec, NULL)) < 0) {
-        qDebug() << "ERROR: failed to open video decoder";
+        qWarning() << "ERROR: failed to open video decoder";
         return return_value;
     }
 
@@ -1467,17 +1509,18 @@ QImage MetaDatabaseWorker::FrameToImage(const AVFrame* frame) const
 
 void MetaDatabaseWorker::AddAdditionalDatabaseFields(std::map<QString, QVariant>* metadata_map, QString key, QVariant value, bool overwrite)
 {
-    if (metadata_map and not metadata_map->empty() and value.isValid())
+    //if (metadata_map and not metadata_map->empty() and value.isValid())
+    if (metadata_map and value.isValid())
         if (metadata_map->contains(key)) {
             if (overwrite)
                 metadata_map->at(key) = value;
-            else
-                qDebug() << "[Not Overwritten] Key:" << key << " - Value:" << metadata_map->at(key) << " - New Value:" << value;
+            //else
+                //qDebug() << "[Not Overwritten] Key:" << key << " - Value:" << metadata_map->at(key) << " - New Value:" << value;
         }
         else
             metadata_map->insert({ key, value });
-    else
-        qDebug() << "Empty metadata_map, not adding:" << key;
+    //else
+        //qDebug() << "Null metadata_map or invalid value, not adding:" << key;
 }
 void MetaDatabaseWorker::AddAdditionalDatabaseFields(std::vector< std::unique_ptr<std::map<QString, QVariant>> >& metadata_maps, QString key, QVariant value, bool overwrite, int stream)
 {
@@ -1494,20 +1537,20 @@ bool MetaDatabaseWorker::AddToDatabase()
     QList<QString> metadata_query_strings;
 
     for (auto& map : general_metadata_maps) {
-        metadata_query_strings.append(BuildDatabaseInsertQueryString(map.get(), DatabaseSchema::Tables::General));
+        metadata_query_strings.append(BuildDatabaseInsertQueryString(map.get(), Table::General));
     }
     if (not duplicate_file_found) {
         for (auto& map : video_metadata_maps) {
-            metadata_query_strings.append(BuildDatabaseInsertQueryString(map.get(), DatabaseSchema::Tables::Graphic));
+            metadata_query_strings.append(BuildDatabaseInsertQueryString(map.get(), Table::Graphic));
         }
         for (auto& map : audio_metadata_maps) {
-            metadata_query_strings.append(BuildDatabaseInsertQueryString(map.get(), DatabaseSchema::Tables::Audio));
+            metadata_query_strings.append(BuildDatabaseInsertQueryString(map.get(), Table::Audio));
         }
         for (auto& map : music_metadata_maps) {
-            metadata_query_strings.append(BuildDatabaseInsertQueryString(map.get(), DatabaseSchema::Tables::Music));
+            metadata_query_strings.append(BuildDatabaseInsertQueryString(map.get(), Table::Music));
         }
         for (auto& map : image_metadata_maps) {
-            metadata_query_strings.append(BuildDatabaseInsertQueryString(map.get(), DatabaseSchema::Tables::Graphic));
+            metadata_query_strings.append(BuildDatabaseInsertQueryString(map.get(), Table::Graphic));
         }
     }
     return ExecuteQueryStrings(metadata_query_strings);
@@ -1518,63 +1561,78 @@ bool MetaDatabaseWorker::UpdateDatabase()
     bool success = true;
     QList<QString> metadata_query_strings;
 
-    if (update_metadata) {
+    if ((MA::Update::Metadata) & update_filter) {
 
-        // TODO: Testing Needed, then finish rest of maps
-
-        //for (auto& map : general_metadata_maps) {
         for (int i = 0; i < general_metadata_maps.size(); i++) {
-
             auto& map = general_metadata_maps.at(i);
-
-            for (auto& field : MA::General::Field::getAllFields()) {
-
-                if (not map->contains(field)) {
-                    KeyValuePair key_value_pair(field, QVariant()); // Reset to NULL
-                    success = PlaceKeyValuePairIntoCorrectMap(key_value_pair, MediaInfoDLL::stream_t::Stream_General, i);
-
+            for (auto& field : Field::General::getAllFields()) {
+                if (not map->contains(field) and (field != Field::General::ThumbnailData and field != Field::General::ThumbnailPath)) {
+                    KeyValuePair key_value_pair(field, QVariant()); // Reset to NULL (TODO: except thumbnails)
                     // alt
                     //AddAdditionalDatabaseFields(general_metadata_maps.at(i).get(), field, media_type);
-
-                    if (not success)
+                    if (not PlaceKeyValuePairIntoCorrectMap(key_value_pair, MediaInfoDLL::stream_t::Stream_General, i))
                         qWarning() << "WANRING: Field not added to map:" << field;
                 }
-                // TODO: double check 
-                if (not map->contains(field)) {
-                    qWarning() << "WANRING: Field not added to map:" << field;
-                }
             }
-            metadata_query_strings.append(BuildDatabaseUpdateQueryString(map.get(), DatabaseSchema::Tables::General));
+            metadata_query_strings.append(BuildDatabaseUpdateQueryString(map.get(), Table::General));
         }
-
 
         for (int i = 0; i < video_metadata_maps.size(); i++) {
             auto& map = video_metadata_maps.at(i);
-            for (auto& field : MA::Graphic::Field::getAllFields()) {
+            for (auto& field : Field::Graphic::getAllFields()) {
                 if (not map->contains(field)) {
                     KeyValuePair key_value_pair(field, QVariant()); // Reset to NULL
-                    success = PlaceKeyValuePairIntoCorrectMap(key_value_pair, MediaInfoDLL::stream_t::Stream_Video, i);
-                    if (not success)
+                    if (not PlaceKeyValuePairIntoCorrectMap(key_value_pair, MediaInfoDLL::stream_t::Stream_Video, i))
                         qWarning() << "WANRING: Field not added to map:" << field;
                 }
-                // TODO: double check 
+            }
+            metadata_query_strings.append(BuildDatabaseUpdateQueryString(map.get(), Table::Graphic));
+        }
+        for (int i = 0; i < music_metadata_maps.size(); i++) {
+            auto& map = music_metadata_maps.at(i);
+            for (auto& field : Field::Music::getAllFields()) {
                 if (not map->contains(field)) {
-                    qWarning() << "WANRING: Field not added to map:" << field;
+                    KeyValuePair key_value_pair(field, QVariant()); // Reset to NULL
+                    if (not PlaceKeyValuePairIntoCorrectMap(key_value_pair, MediaInfoDLL::stream_t::Stream_General, i)) 
+                        qWarning() << "WANRING: Field not added to map:" << field;
                 }
             }
-            metadata_query_strings.append(BuildDatabaseUpdateQueryString(map.get(), DatabaseSchema::Tables::Graphic));
+            metadata_query_strings.append(BuildDatabaseUpdateQueryString(map.get(), Table::Music));
         }
-
+        for (int i = 0; i < audio_metadata_maps.size(); i++) {
+            auto& map = audio_metadata_maps.at(i);
+            for (auto& field : Field::Audio::getAllFields()) {
+                if (not map->contains(field)) {
+                    KeyValuePair key_value_pair(field, QVariant()); // Reset to NULL
+                    if (not PlaceKeyValuePairIntoCorrectMap(key_value_pair, MediaInfoDLL::stream_t::Stream_Audio, i))
+                        qWarning() << "WANRING: Field not added to map:" << field;
+                }
+            }
+            metadata_query_strings.append(BuildDatabaseUpdateQueryString(map.get(), Table::Audio));
+        }
+        for (int i = 0; i < image_metadata_maps.size(); i++) { // TODO: there may be a problem with Graphic table multi streams where a video and image are found (find an example file for testing)
+            auto& map = image_metadata_maps.at(i);
+            for (auto& field : Field::Graphic::getAllFields()) {
+                if (not map->contains(field)) {
+                    KeyValuePair key_value_pair(field, QVariant()); // Reset to NULL
+                    if (not PlaceKeyValuePairIntoCorrectMap(key_value_pair, MediaInfoDLL::stream_t::Stream_Image, i))
+                        qWarning() << "WANRING: Field not added to map:" << field;
+                }
+            }
+            metadata_query_strings.append(BuildDatabaseUpdateQueryString(map.get(), Table::Graphic));
+        }
     }
-    // TODO...
-
+    else if ((MA::Update::SmallFileThumbnails | MA::Update::AllFileThumbnails) & update_filter) {
+        if (general_metadata_maps.at(0)->contains(Field::General::ThumbnailData) or general_metadata_maps.at(0)->contains(Field::General::ThumbnailPath))
+            metadata_query_strings.append(BuildDatabaseUpdateQueryString(general_metadata_maps.at(0).get(), Table::General));
+    }
 
     if (user_meta) {
-        if (ExistsInDatabase(DatabaseSchema::Tables::UserMeta))
-            metadata_query_strings.append(BuildDatabaseUpdateQueryString(user_meta, DatabaseSchema::Tables::UserMeta));
+        if (ExistsInDatabase(Table::UserMeta))
+            metadata_query_strings.append(BuildDatabaseUpdateQueryString(user_meta, Table::UserMeta));
         else {
-            user_meta->at(MA::UserMeta::Field::Id).setValue(file_id);
-            metadata_query_strings.append(BuildDatabaseInsertQueryString(user_meta, DatabaseSchema::Tables::UserMeta));
+            user_meta->at(Field::UserMeta::Id).setValue(file_id);
+            metadata_query_strings.append(BuildDatabaseInsertQueryString(user_meta, Table::UserMeta));
         }
     }
 
@@ -1588,22 +1646,24 @@ bool MetaDatabaseWorker::ExecuteQueryStrings(QList<QString> query_strings)
     QSqlQuery query(database);
     for (auto& qs : query_strings) {
         //qDebug() << qs;
-        query.prepare(qs);
-        if (general) {
-            query.bindValue(":thumbnail", thumbnail_data);
-            general = false;
+        if (qs.length()) {
+            query.prepare(qs);
+            if (general) {
+                query.bindValue(":thumbnail", thumbnail_data);
+                general = false;
+            }
+            if (query.exec()) {
+                qDebug().nospace() << "Values added/updated successfully to DB. | File: " << file_path.filename().string() << " | Query: " << query.lastQuery();
+                //success = true;
+            }
+            else {
+                qWarning() << "ERROR: Failed To add Values from file:" << file_path.filename().string() << " | " << query.lastError();
+                qWarning() << "ERROR: The Failed Query:" << query.lastQuery();
+                success = false;
+            }
+            query.clear();
+            query.finish();
         }
-        if (query.exec()) {
-            qDebug().nospace() << "Values added/updated successfully to DB. | File: " << file_path.filename().string() << " | Query: " << query.lastQuery();
-            //success = true;
-        }
-        else {
-            qWarning() << "ERROR: Failed To add Values from file:" << file_path.filename().string() << " | " << query.lastError();
-            qWarning() << "ERROR: The Failed Query:" << query.lastQuery();
-            success = false;
-        }
-        query.clear();
-        query.finish();
     }
     return success;
 }
@@ -1617,21 +1677,19 @@ QString MetaDatabaseWorker::BuildDatabaseInsertQueryString(std::map<QString, QVa
         values = "VALUES (";
         for (auto& metadata : *metadata_map) {
             insert.append(QString("\"%1\", ").arg(metadata.first));
-            if (metadata.second.isValid()) {
-                if (metadata.second.typeId() == QMetaType::QString) {
+            if (metadata.second.isValid())
+                if (metadata.second.typeId() == QMetaType::QString)
                     if (metadata.second.toString().length() and metadata.second.toString().at(0) == QString(":"))
                         values.append(QString("%1, ").arg(metadata.second.toString())); // "variable" placeholder, value added later
                     else
-                        values.append(QString("'%1', ").arg(metadata.second.toString())); // string
-                }
-                else //if (metadata.second.typeId() == QMetaType::Int or metadata.second.typeId() == QMetaType::Double)
+                        values.append(QString("\"%1\", ").arg(metadata.second.toString())); // string
+                else
                     values.append(QString("%1, ").arg(metadata.second.toString())); // number or some other kind of data
-            }
             else
                 values.append("NULL, ");
         }
-        insert.removeLast().removeLast().append(") ");
-        values.removeLast().removeLast().append(")");
+        insert = insert.first(insert.length() - 2).append(") ");
+        values = values.first(values.length() - 2).append(")");
         //qDebug() << insert + values;
     }
     return insert + values;
@@ -1643,43 +1701,63 @@ QString MetaDatabaseWorker::BuildDatabaseUpdateQueryString(std::map<QString, QVa
     QString where_id;
     if (metadata_map and metadata_map->size()) {
         update = QString("UPDATE \"%1\" SET ").arg(table);
+        where_id = "WHERE ";
         for (auto& metadata : *metadata_map) {
 
-            if (metadata.first == MA::General::Field::Id) {
-                where_id.append(QString("WHERE \"%1\" = '%2';").arg(metadata.first).arg(file_id));
+            // Match File ID and (General::FilePath or Graphic::TrackId or Audio::TrackId or UserMeta::UserId)
+            if (metadata.first == Field::General::Id) {
+                where_id.append(QString("\"%1\" = \"%2\" AND ").arg(metadata.first).arg(file_id));
                 continue;
             }
-            /*else if (metadata.first == MA::UserMeta::Field::UserId) {
-                update.append(QString("\"%1\" = %2").arg(metadata.first).arg(user_id));
+            else if (table == Table::General and metadata.first == Field::General::FilePath) {
+                where_id.append(QString("\"%1\" = \"%2\" AND ").arg(metadata.first).arg(file_path_str));
                 continue;
-            }*/
+            }
+            else if (table == Table::Graphic and metadata.first == Field::Graphic::TrackId and metadata.second.isValid()) {
+                where_id.append(QString("\"%1\" = %2 AND ").arg(metadata.first).arg(metadata.second.toString()));
+                continue;
+            }
+            else if (table == Table::Audio and metadata.first == Field::Audio::TrackId and metadata.second.isValid()) {
+                where_id.append(QString("\"%1\" = %2 AND ").arg(metadata.first).arg(metadata.second.toString()));
+                continue;
+            }
+            else if (table == Table::UserMeta and metadata.first == Field::UserMeta::UserId) {
+                update.append(QString("\"%1\" = %2 AND ").arg(metadata.first).arg(user_id));
+                continue;
+            }
             else {
                 update.append(QString("\"%1\" = ").arg(metadata.first));
             }
-            if (metadata.second.isValid()) {
-                if (metadata.second.typeId() == QMetaType::QString) {
+
+            if (metadata.second.isValid())
+                if (metadata.second.typeId() == QMetaType::QString)
                     if (metadata.second.toString().length() and metadata.second.toString().at(0) == QString(":"))
                         update.append(QString("%1, ").arg(metadata.second.toString())); // "variable" placeholder, value added later
                     else
-                        update.append(QString("'%1', ").arg(metadata.second.toString())); // string
-                }
+                        update.append(QString("\"%1\", ").arg(metadata.second.toString())); // string
                 else
                     update.append(QString("%1, ").arg(metadata.second.toString())); // number or some other kind of data
-            }
             else
                 update.append("NULL, ");
         }
-        update.removeLast().removeLast().append(" ");
-        if (where_id.length() == 0) {
-            qWarning() << "ERROR: Database Update will Fail, WHERE Id is missing!";
-            qWarning() << "ERROR: Query String:" << update;
+        update = update.first(update.length() - 2).append(" ");
+        where_id = where_id.first(where_id.length() - 5).append(";");
+        if (update.length() < 20) {
+            qWarning() << "ERROR: Database Update will Fail, No Fields SET!";
+            qWarning() << "ERROR: Query String:" << update + where_id;
             update = "";
+            where_id = "";
+        }
+        if (where_id.length() < 7) {
+            qWarning() << "ERROR: Database Update will Fail, WHERE Id is missing!";
+            qWarning() << "ERROR: Query String:" << update + where_id;
+            update = "";
+            where_id = "";
         }
         //qDebug() << update + where_id;
     }
     return update + where_id;
 }
-
 
 // Not Needed, Delete?
 QVariant MetaDatabaseWorker::stringToNumber(QString str)
