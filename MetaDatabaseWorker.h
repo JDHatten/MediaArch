@@ -4,6 +4,7 @@
 
 #include <QBuffer>
 #include <QDateTime>
+#include <QMutex>
 #include <QtSql/QSql>
 #include <QtSql/QSqlDatabase>
 #include <QtSql/QSqlDriver>
@@ -48,15 +49,12 @@ class MetaDatabaseWorker : public QObject
 
 public:
 
-    static enum DatabaseUpdateCode {
-        Failed, NewlyAdded, Updated, AlreadyExisted, NewDuplicateAdded
-    };
     struct KeyValuePair {
         QString key;
         QVariant value;
     };
 
-    MetaDatabaseWorker(std::filesystem::path file_path, int user_id, bool refresh_metadata = false, std::map<QString, QVariant>* updated_user_meta = nullptr, QObject* parent = nullptr);
+    MetaDatabaseWorker(std::filesystem::path file_path, int user_id, int update_filter = MA::Update::Nothing, std::map<QString, QVariant>* updated_user_meta = nullptr, QObject* parent = nullptr);
     ~MetaDatabaseWorker();
 
     /// <summary>
@@ -74,6 +72,9 @@ public:
 private:
 
     QSqlDatabase database;
+    QMutex mutex;
+    MediaItem* media_item;
+    const QRegularExpression re_table_stream{ "(?<table>[a-zA-Z]+)(?<stream>\\d*)" };
     std::filesystem::path file_path;
     QString file_path_str;
     QString file_id = "0";
@@ -81,9 +82,13 @@ private:
     size_t file_size = 0;
     time_t file_date_created = 0;
     time_t file_date_modified = 0;
-    MediaItem::Type::Filter media_type = MediaItem::Type::Unknown;
-    int media_filters = MediaItem::Type::Unknown;
-
+    int frame_count = 0;
+    MA::Type media_type = MA::Type::Unknown;
+    int media_filters = MA::Type::Unknown;
+    int update_filter = MA::Update::Nothing;
+    const long long video_thumbnail_max_file_size = 20971520; // 20 mb, TODO: user setting
+    const long long non_video_thumbnail_max_file_size = 104857600; // 100 mb, TODO: user setting
+    //const long long non_video_thumbnail_max_file_size = 268435456; // 250 mb, TODO: user setting
     QByteArray thumbnail_data = 0;
     QString thumbnail_path;
     AVFormatContext* fmt_ctx = nullptr;
@@ -98,14 +103,14 @@ private:
     std::vector< std::unique_ptr<std::map<QString, QVariant>> > image_metadata_maps;
 
     bool duplicate_file_found = false;
-    bool update_metadata = false;
+    //bool update_metadata = false;
     std::map<QString, QVariant>* user_meta = nullptr;
 
     bool GenerateFileId(bool use_265_bit_hash = false);
     bool OpenDatabase();
-    bool ExistsInDatabase(QString table = MA::General::Title);
+    bool ExistsInDatabase(QString table = Table::General);
 
-    MediaItem::Type::Filter BuildMetadataMaps();
+    MA::Type BuildMetadataMaps();
     QVariant SterilizeValue(std::wstring value);
     KeyValuePair GetProperKeyAndValue(const std::wstring key, const std::wstring value, const MediaInfoDLL::stream_t stream_kind);
     bool PlaceKeyValuePairIntoCorrectMap(KeyValuePair key_value_pair, MediaInfoDLL::stream_t stream_kind, int stream);
@@ -133,7 +138,7 @@ public slots:
 
 signals:
 
-    void databaseUpdated(int code);
+    void databaseUpdated(MA::Database::FinishCode code);
     void databaseRecordsRetrieved(std::filesystem::path file_path, std::map<QString, QSqlRecord>* table_record_map);
 
 };
