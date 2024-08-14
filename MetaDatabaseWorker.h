@@ -54,7 +54,8 @@ public:
         QVariant value;
     };
 
-    MetaDatabaseWorker(std::filesystem::path file_path, int user_id, int update_filter = MA::Update::Nothing, std::map<QString, QVariant>* updated_user_meta = nullptr, QObject* parent = nullptr);
+    //MetaDatabaseWorker(std::filesystem::path file_path, int user_id, int update_filter = MA::Update::Nothing, std::map<QString, QVariant>* updated_user_meta = nullptr, QObject* parent = nullptr);
+    MetaDatabaseWorker(MediaItem* media_item, int user_id, int update_filter = MA::Update::Nothing, std::map<QString, QVariant>* updated_user_meta = nullptr, QObject* parent = nullptr);
     ~MetaDatabaseWorker();
 
     /// <summary>
@@ -73,7 +74,7 @@ private:
 
     QSqlDatabase database;
     QMutex mutex;
-    MediaItem* media_item;
+    MediaItem* media_item = nullptr;
     const QRegularExpression re_table_stream{ "(?<table>[a-zA-Z]+)(?<stream>\\d*)" };
     std::filesystem::path file_path;
     QString file_path_str;
@@ -109,6 +110,7 @@ private:
     bool GenerateFileId(bool use_265_bit_hash = false);
     bool OpenDatabase();
     bool ExistsInDatabase(QString table = Table::General);
+    void SendMetadataToMediaItem();
 
     MA::Type BuildMetadataMaps();
     QVariant SterilizeValue(std::wstring value);
@@ -140,6 +142,7 @@ signals:
 
     void databaseUpdated(MA::Database::FinishCode code);
     void databaseRecordsRetrieved(std::filesystem::path file_path, std::map<QString, QSqlRecord>* table_record_map);
+    void mediaItemUpdated(MediaItem* media_item);
 
 };
 
