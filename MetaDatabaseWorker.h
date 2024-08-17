@@ -42,6 +42,7 @@ extern "C" {
 //#include "MediaSpaces.h"
 //#include "MediaViewer.h"
 #include "MediaItem.h"
+#include "UserSettings.h"
 
 class MetaDatabaseWorker : public QObject
 {
@@ -55,7 +56,7 @@ public:
     };
 
     //MetaDatabaseWorker(std::filesystem::path file_path, int user_id, int update_filter = MA::Update::Nothing, std::map<QString, QVariant>* updated_user_meta = nullptr, QObject* parent = nullptr);
-    MetaDatabaseWorker(MediaItem* media_item, int user_id, int update_filter = MA::Update::Nothing, std::map<QString, QVariant>* updated_user_meta = nullptr, QObject* parent = nullptr);
+    MetaDatabaseWorker(MediaItem* media_item, UserSettings user_settings, int update_filter = MA::Update::Nothing, std::map<QString, QVariant>* updated_user_meta = nullptr, QObject* parent = nullptr);
     ~MetaDatabaseWorker();
 
     /// <summary>
@@ -75,11 +76,12 @@ private:
     QSqlDatabase database;
     QMutex mutex;
     MediaItem* media_item = nullptr;
+    UserSettings user_settings;
+    int user_id = 0;
     const QRegularExpression re_table_stream{ "(?<table>[a-zA-Z]+)(?<stream>\\d*)" };
     std::filesystem::path file_path;
     QString file_path_str;
     QString file_id = "0";
-    int user_id = 0;
     size_t file_size = 0;
     time_t file_date_created = 0;
     time_t file_date_modified = 0;
@@ -87,9 +89,9 @@ private:
     MA::Type media_type = MA::Type::Unknown;
     int media_filters = MA::Type::Unknown;
     int update_filter = MA::Update::Nothing;
-    const long long video_thumbnail_max_file_size = 20971520; // 20 mb, TODO: user setting
-    const long long non_video_thumbnail_max_file_size = 104857600; // 100 mb, TODO: user setting
-    //const long long non_video_thumbnail_max_file_size = 268435456; // 250 mb, TODO: user setting
+    long long video_thumbnail_max_file_size = 20971520; // 20 mb
+    //const long long non_video_thumbnail_max_file_size = 104857600; // 100 mb, TODO: user setting?
+    const long long non_video_thumbnail_max_file_size = 268435456; // 250 mb, TODO: user setting?
     QByteArray thumbnail_data = 0;
     QString thumbnail_path;
     AVFormatContext* fmt_ctx = nullptr;

@@ -1,11 +1,13 @@
 #include "MetaDatabaseWorker.h"
 
-MetaDatabaseWorker::MetaDatabaseWorker(std::filesystem::path file_path, int user_id, int update_filter, std::map<QString, QVariant>* updated_user_meta, QObject* parent)
-    : QObject(parent), file_path(file_path), user_id(user_id), update_filter(update_filter), user_meta(updated_user_meta)
+MetaDatabaseWorker::MetaDatabaseWorker(MediaItem* media_item, UserSettings user_settings, int update_filter, std::map<QString, QVariant>* updated_user_meta, QObject* parent)
+    : QObject(parent), media_item(media_item), user_settings(user_settings), update_filter(update_filter), user_meta(updated_user_meta)
 {
+    MetaDatabaseWorker::file_path = media_item->getFilePath();
     MetaDatabaseWorker::file_path_str = QString::fromStdString(file_path.make_preferred().string());
+    user_id = user_settings.getUserSetting(Field::Settings::UserId).toInt();
+    video_thumbnail_max_file_size = user_settings.getUserSetting(Field::Settings::AutoGenerateVideoSizeLimit).toLongLong() * 1024 * 1024;
     //qDebug().nospace() << "MetaDatabaseWorker Constructed (" << file_path_str << ")";
-    //general_metadata_maps.reserve(1);
 }
 
 MetaDatabaseWorker::~MetaDatabaseWorker()
@@ -53,7 +55,8 @@ void MetaDatabaseWorker::addRecord()
                     if (duplicate_file_found) {
                         if (AddToDatabase()) {
                             db_code = MA::Database::FinishCode::NewDuplicateAdded;
-                            getRecord();
+                            //getRecord();
+                            SendMetadataToMediaItem();
                         }
                         else {
                             // TODO: Inform user of error and how to possibly fix it.
@@ -62,7 +65,8 @@ void MetaDatabaseWorker::addRecord()
                     else {
                         if (UpdateDatabase()) {
                             db_code = MA::Database::FinishCode::Updated;
-                            getRecord();
+                            //getRecord();
+                            SendMetadataToMediaItem();
                         }
                         else {
                             // TODO: Inform user of error and how to possibly fix it.
@@ -72,7 +76,8 @@ void MetaDatabaseWorker::addRecord()
                 else {
                     //qDebug().nospace() << "This file already exist in the database and no update is required.";
                     db_code = MA::Database::FinishCode::AlreadyExisted;
-                    getRecord();
+                    //getRecord();
+                    SendMetadataToMediaItem();
                 }
             }
             else {
@@ -86,7 +91,8 @@ void MetaDatabaseWorker::addRecord()
 
                 if (AddToDatabase()) {
                     db_code = MA::Database::FinishCode::NewlyAdded;
-                    getRecord();
+                    //getRecord();
+                    SendMetadataToMediaItem();
                 }
                 else {
                     // TODO: Inform user of error and how to possibly fix it.
@@ -121,10 +127,11 @@ void MetaDatabaseWorker::getRecord()
             for (auto& table : DatabaseSchema::getAllTables(true)) {
                 
                 select = QString("SELECT * FROM \"%1\" WHERE \"%2\" = \"%3\"")
-                    .arg(table)
-                    .arg(Field::General::Id)
-                    .arg(file_id);
-                //qDebug() << select;
+                    .arg(table).arg(Field::General::Id).arg(file_id);
+                if (table == Table::UserMeta) {
+                    select.append(QString(" AND \"%1\" = %2")
+                        .arg(Field::UserMeta::UserId).arg(user_id));
+                }
                 query.prepare(select);
 
                 if (query.exec()) {
@@ -156,6 +163,96 @@ void MetaDatabaseWorker::getRecord()
 
     if (table_record_map->size())
         emit databaseRecordsRetrieved(file_path, table_record_map);
+}
+
+void MetaDatabaseWorker::SendMetadataToMediaItem()
+{
+    if (GenerateFileId()) {
+
+        if (OpenDatabase()) {
+
+            QString select;
+            QSqlQuery query(database);
+            bool update_only_user_meta = (update_filter == MA::Update::Nothing and user_meta);
+
+            mutex.lock();
+
+            for (auto& table : DatabaseSchema::getAllTables(true)) {
+
+                if (update_only_user_meta and table != Table::UserMeta)
+                    continue; // Only update media_item with user meta, skip the rest.
+
+                select = QString("SELECT * FROM \"%1\" WHERE \"%2\" = \"%3\"")
+                    .arg(table).arg(Field::General::Id).arg(file_id);
+                if (table == Table::UserMeta) {
+                    select.append(QString(" AND \"%1\" = %2")
+                        .arg(Field::UserMeta::UserId).arg(user_id));
+                }
+                query.prepare(select);
+
+                if (query.exec()) {
+                    int stream_index = 0;
+                    while (query.next()) { // if this loops then its a new stream/track/dupe
+                        //QString table_str = table;
+                        QSqlRecord record = query.record();
+
+                        MA::Type graphic_type = MA::Type::Unknown;
+                        if (table == Table::Graphic)
+                            graphic_type = MA::Type(record.value(Field::Graphic::Type).toInt());
+
+                        // TODO: get video/audio default stream, if possible. Or use "user meta" option so the chosen default is shown first / in labels / etc.
+
+                        // TODO: Only send the correct General metadata and not the duplicates?
+                        // Or send all and only show the "setDefaultStream", then something can be done like "show duplicate files", etc.
+                        if (table == Table::General) {
+                            //qDebug() << record.value(Field::General::FilePath).toString() << "=/=" << file_path_str;
+                            if (record.value(Field::General::FilePath).toString() == file_path_str)
+                                stream_index = 0; // media_item->setDefaultStream(table, stream_index);
+                            else {
+                                // Only first duplicate will get thumbnail data, so use the same data for each duplicate and skip other metadata. TODO: ThumbnailPath?
+                                QVariant thumbnail_data = record.value(Field::General::ThumbnailData);
+                                if (thumbnail_data.isValid()) {
+                                    media_item->updateThumbnail(thumbnail_data.toByteArray());
+                                }
+                                continue;
+                            }
+                        }
+                        for (QString field : DatabaseSchema::getAllFieldsFor(table)) {
+
+                            QVariant value = record.value(field);
+                            if (value.isValid() and not value.isNull() and value.toString().length()) { // ignores "" but allows 0
+
+                                // Intercept thumbnail data/path
+                                if (field == Field::General::ThumbnailData) {
+                                    media_item->updateThumbnail(value.toByteArray());
+                                }
+                                else if (field == Field::General::ThumbnailPath) {
+                                    media_item->updateThumbnail(value.toString()); // Only if not already set via ThumbnailData
+                                }
+                                else {
+                                    media_item->addMetadata(table, field, value, stream_index, graphic_type);
+                                    //qDebug() << property_name << ":" << value;
+                                }
+                            }
+                        }
+                        stream_index++;
+                        /*/
+                        for (int i = 0; i < record.count(); i++) {
+                            if (record.fieldName(i) == Field::General::ThumbnailData) continue;
+                            qDebug().nospace() << ">>" << table << " (" << record.count() << ") :: " << record.fieldName(i) << " : " << record.value(i);
+                        }//*/
+                    }
+                }
+                else {
+                    qWarning() << "ERROR: Query Failed:" << query.lastError();
+                    qWarning() << "ERROR:" << query.lastQuery();
+                }
+                query.finish();
+            }
+            mutex.unlock();
+        }
+    }
+    emit mediaItemUpdated(media_item);
 }
 
 bool MetaDatabaseWorker::GenerateFileId(bool use_265_bit_hash)
@@ -345,6 +442,16 @@ MA::Type MetaDatabaseWorker::BuildMetadataMaps()
         }
     }
 
+
+
+    // TODO: WebP, SVG, GIF, (Others?) need work.  
+    // WebP = get metadata
+    // SVG = text file, read code to get metadata, width / height, format: SVG / XML, Colors?, not much else 
+    // GIF = Special Thumbnail: get path and play/stop movie on hover
+
+
+
+
     // Move music metadata from general_metadata to music_metadata.
     /*for (auto& field : Field::Music::getAllFields()) {
         if (general_metadata->contains(field)) {
@@ -419,8 +526,6 @@ MA::Type MetaDatabaseWorker::BuildMetadataMaps()
     AddAdditionalDatabaseFields(general_metadata_maps, Field::General::FileSize, file_size, false);
     AddAdditionalDatabaseFields(general_metadata_maps, Field::General::FileCreated, file_date_created, false);
     AddAdditionalDatabaseFields(general_metadata_maps, Field::General::FileLastMod, file_date_modified, false);
-    //AddAdditionalDatabaseFields(general_metadata_maps, Field::General::FileReadOnly, file_read_only);
-    //AddAdditionalDatabaseFields(general_metadata_maps, Field::General::FileHidden, file_hidden);
     AddAdditionalDatabaseFields(general_metadata_maps, Field::General::FileAttributes, static_cast<long long>(attributes));
     AddAdditionalDatabaseFields(general_metadata_maps, Field::General::FileTargetPath, target_path_str);
     if (not duplicate_file_found) {
@@ -466,14 +571,14 @@ MA::Type MetaDatabaseWorker::BuildMetadataMaps()
 
 QVariant MetaDatabaseWorker::SterilizeValue(std::wstring value)
 {
-    // TODO: Sterilize All Values (Tested: ' " \) (So far only ' needs special escaping)
+    /*/ TODO: Sterilize All Values (Tested: ' " \) ('Sigle Quotes' no longer need special escaping)
     intptr_t found_index = -2;
     while (found_index != value.npos) {
         found_index = value.find_first_of(L"'", found_index + 2);
         if (found_index != value.npos)
             value.insert(found_index, L"'");
         //value.replace(found_index, 1, L"\""); // Use to test a possible problem char. 
-    };
+    };//*/
     return QString::fromStdWString(value);
 }
 
@@ -543,8 +648,8 @@ MetaDatabaseWorker::KeyValuePair MetaDatabaseWorker::GetProperKeyAndValue(std::w
         }
         else if (key == MEDIA_INFO::GENERAL::FILE_PATH) {
             new_key = Field::General::FilePath;
-            //new_val = file_path_str;
-            new_val = SterilizeValue(file_path_str.toStdWString());
+            new_val = file_path_str;
+            //new_val = SterilizeValue(file_path_str.toStdWString());
         }
         /*else if (key == MEDIA_INFO::GENERAL::FILE_SIZE) { // Added later with a number in bytes
             new_key = Field::General::FileSize;
@@ -903,9 +1008,8 @@ MetaDatabaseWorker::KeyValuePair MetaDatabaseWorker::GetProperKeyAndValue(std::w
 
     // TODO: if (MediaInfoDLL::stream_t::Stream_Text == stream_kind) {
 
-    if (new_key == "") {
-        qDebug() << "WARNING: No proper key (database field) found for" << key << " |  Type:" << MEDIA_INFO::print(stream_kind);
-    }
+    //if (new_key == "")
+    //    qDebug() << "WARNING: No proper key (database field) found for" << key << " |  Type:" << MEDIA_INFO::print(stream_kind);
 
     return KeyValuePair(new_key, new_val);
 }
@@ -1049,7 +1153,13 @@ HRESULT MetaDatabaseWorker::resolveWindowsLink(HWND hwnd, LPCSTR lpszLinkFile, L
 
 void MetaDatabaseWorker::CreateThumbnailImages()
 {
-    // Note: Don't create and save more of the same thumbnail if dupe, but still get any different thumbnail paths. (TODO: use correct path and fall back to oringal dupe thumbnail path if not found)
+
+    // TODO: user setting - user direct path to custom image
+    // TODO: Based on above use this to search for more images based on each file (in current directory) without a thumbnail.
+    //       Search that "direct path", parrent, and sub-dirs of parent if it matches the same name as the parent of "direct path"
+    
+
+    // Note: Don't create and save more of the same thumbnail if dupe, but still get any different thumbnail paths. (TODO: use correct path and fall back to original dupe thumbnail path if not found)
     if ((MA::Type::Video | MA::Type::Image | MA::Type::Music) & media_filters and not duplicate_file_found) {
     
         //int duration;
@@ -1067,7 +1177,7 @@ void MetaDatabaseWorker::CreateThumbnailImages()
             else if (frame_count == 0) {
                 qWarning() << "WARNING: Missing frame_count, need alt why to create 'frame_interval'";
             }
-            thumbnail_count = 8; // TODO: user setting
+            thumbnail_count = user_settings.getUserSetting(Field::Settings::VideoThumbnailCount).toInt();
             frame_interval = frame_count / (thumbnail_count + 1);
             skip_frames_above = frame_count - frame_interval;
 
@@ -1313,8 +1423,7 @@ AVFrame* MetaDatabaseWorker::DecodeFrame(AVCodecContext* codec_ctx, AVFrame* fra
         return nullptr;
     }
 
-    //TODO: get user setting "media_item_size"
-    int media_item_size = 256;
+    int media_item_size = user_settings.getUserSetting(Field::Settings::MediaItemStorageSize).toInt();;
 
     // Scale image keeping aspect ratio
     int scaled_width = codec_ctx->width;
@@ -1567,8 +1676,7 @@ bool MetaDatabaseWorker::UpdateDatabase()
             auto& map = general_metadata_maps.at(i);
             for (auto& field : Field::General::getAllFields()) {
                 if (not map->contains(field) and (field != Field::General::ThumbnailData and field != Field::General::ThumbnailPath)) {
-                    KeyValuePair key_value_pair(field, QVariant()); // Reset to NULL (TODO: except thumbnails)
-                    // alt
+                    KeyValuePair key_value_pair(field, QVariant()); // Reset to NULL (except thumbnails)
                     //AddAdditionalDatabaseFields(general_metadata_maps.at(i).get(), field, media_type);
                     if (not PlaceKeyValuePairIntoCorrectMap(key_value_pair, MediaInfoDLL::stream_t::Stream_General, i))
                         qWarning() << "WANRING: Field not added to map:" << field;
