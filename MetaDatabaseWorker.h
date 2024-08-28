@@ -15,9 +15,6 @@
 #include <QtSql/QSqlField>
 #include <QThread>
 
-//#include <qfile>
-//#include <qcryptographichash.h>
-
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <errno.h>
@@ -81,11 +78,13 @@ private:
     const QRegularExpression re_table_stream{ "(?<table>[a-zA-Z]+)(?<stream>\\d*)" };
     std::filesystem::path file_path;
     QString file_path_str;
+    std::string file_extension;
     QString file_id = "0";
     size_t file_size = 0;
     time_t file_date_created = 0;
     time_t file_date_modified = 0;
     int frame_count = 0;
+    QString file_format = "";
     MA::Type media_type = MA::Type::Unknown;
     int media_filters = MA::Type::Unknown;
     int update_filter = MA::Update::Nothing;
@@ -94,8 +93,8 @@ private:
     const long long non_video_thumbnail_max_file_size = 268435456; // 250 mb, TODO: user setting?
     QByteArray thumbnail_data = 0;
     QString thumbnail_path;
-    AVFormatContext* fmt_ctx = nullptr;
-    AVCodecContext* dec_ctx = nullptr;
+    AVFormatContext* format_context = nullptr;
+    AVCodecContext* decoder_context = nullptr;
     int video_stream_index = -1;
 
     // Note: There should never be multiple "General Streams/Tracks/Maps".  However, there can be multiple "General Tables" for duplicate files.
