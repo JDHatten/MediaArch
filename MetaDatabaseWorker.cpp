@@ -5,6 +5,8 @@ MetaDatabaseWorker::MetaDatabaseWorker(MediaItem* media_item, UserSettings user_
 {
     MetaDatabaseWorker::file_path = media_item->getFilePath();
     MetaDatabaseWorker::file_path_str = QString::fromStdString(file_path.make_preferred().string());
+    file_extension = file_path.extension().string();
+    std::transform(file_extension.begin(), file_extension.end(), file_extension.begin(), tolower);
     user_id = user_settings.getUserSetting(Field::Settings::UserId).toInt();
     video_thumbnail_max_file_size = user_settings.getUserSetting(Field::Settings::AutoGenerateVideoSizeLimit).toLongLong() * 1024 * 1024;
     //qDebug().nospace() << "MetaDatabaseWorker Constructed (" << file_path_str << ")";
@@ -13,10 +15,10 @@ MetaDatabaseWorker::MetaDatabaseWorker(MediaItem* media_item, UserSettings user_
 MetaDatabaseWorker::~MetaDatabaseWorker()
 {
     database.close();
-    if (fmt_ctx)
-        delete fmt_ctx;
-    if (dec_ctx)
-        delete dec_ctx;
+    if (format_context)
+        delete format_context;
+    if (decoder_context)
+        delete decoder_context;
     //qDebug().nospace() << "...MetaDatabaseWorker Deconstructed (" << file_path.filename().string() << ")";
 }
 
@@ -46,9 +48,9 @@ void MetaDatabaseWorker::addRecord()
                         CreateThumbnailImages();
                     }
                     else if (MA::Update::SmallFileThumbnails & update_filter) {
-                        if (media_type & MA::Type::Video and file_size < video_thumbnail_max_file_size)
+                        if (media_type & MA::Media::Type::Video and file_size < video_thumbnail_max_file_size)
                             CreateThumbnailImages();
-                        else if (media_type != MA::Type::Video and file_size < non_video_thumbnail_max_file_size)
+                        else if (media_type != MA::Media::Type::Video and file_size < non_video_thumbnail_max_file_size)
                             CreateThumbnailImages();
                     }
                     
@@ -84,9 +86,9 @@ void MetaDatabaseWorker::addRecord()
                 media_type = BuildMetadataMaps();
                 //qDebug().nospace() << "This '" << MA::printType(media_type) << "' file will be added to database.";
 
-                if (media_type & MA::Type::Video and file_size < video_thumbnail_max_file_size)
+                if (media_type & MA::Media::Type::Video and file_size < video_thumbnail_max_file_size)
                     CreateThumbnailImages();
-                else if (media_type != MA::Type::Video and file_size < non_video_thumbnail_max_file_size)
+                else if (media_type != MA::Media::Type::Video and file_size < non_video_thumbnail_max_file_size)
                     CreateThumbnailImages();
 
                 if (AddToDatabase()) {
@@ -196,9 +198,9 @@ void MetaDatabaseWorker::SendMetadataToMediaItem()
                         //QString table_str = table;
                         QSqlRecord record = query.record();
 
-                        MA::Type graphic_type = MA::Type::Unknown;
+                        MA::Media::Type graphic_type = MA::Media::Type::Unknown;
                         if (table == Table::Graphic)
-                            graphic_type = MA::Type(record.value(Field::Graphic::Type).toInt());
+                            graphic_type = MA::Media::Type(record.value(Field::Graphic::Type).toInt());
 
                         // TODO: get video/audio default stream, if possible. Or use "user meta" option so the chosen default is shown first / in labels / etc.
 
@@ -337,20 +339,24 @@ bool MetaDatabaseWorker::ExistsInDatabase(QString table)
             while (query.next()) {
                 exists = true;
                 if (query.record().value(Field::General::FilePath).toString() == file_path_str) {
-                    media_filters = MA::Type(query.record().value(Field::General::MediaStreams).toInt());
-                    media_type = MA::Type(query.record().value(Field::General::MediaType).toInt());
+                    media_filters = MA::Media::Type(query.record().value(Field::General::MediaStreams).toInt());
+                    media_type = MA::Media::Type(query.record().value(Field::General::MediaType).toInt());
                     if (query.record().contains(Field::Graphic::FrameCount) and query.record().value(Field::Graphic::FrameCount).isValid())
-                        frame_count = MA::Type(query.record().value(Field::Graphic::FrameCount).toInt());
+                        frame_count = query.record().value(Field::Graphic::FrameCount).toInt();
+                    if (query.record().contains(Field::General::Format) and query.record().value(Field::General::Format).isValid())
+                        file_format = query.record().value(Field::Graphic::Format).toString();
                     duplicate_file_found = false;
                     break;
                 }
                 if (query.record().value(Field::General::FilePath).toString() != file_path_str) {
                     // TODO: Update other tables, or skip? user setting?
                     duplicate_file_found = true;
-                    media_filters = MA::Type(query.record().value(Field::General::MediaStreams).toInt());
-                    media_type = MA::Type(query.record().value(Field::General::MediaType).toInt());
+                    media_filters = MA::Media::Type(query.record().value(Field::General::MediaStreams).toInt());
+                    media_type = MA::Media::Type(query.record().value(Field::General::MediaType).toInt());
                     if (query.record().contains(Field::Graphic::FrameCount) and query.record().value(Field::Graphic::FrameCount).isValid())
-                        frame_count = MA::Type(query.record().value(Field::Graphic::FrameCount).toInt());
+                        frame_count = query.record().value(Field::Graphic::FrameCount).toInt();
+                    if (query.record().contains(Field::General::Format) and query.record().value(Field::General::Format).isValid())
+                        file_format = query.record().value(Field::Graphic::Format).toString();
                 }
             }
         }
@@ -380,14 +386,14 @@ bool MetaDatabaseWorker::ExistsInDatabase(QString table)
     return exists;
 }
 
-MA::Type MetaDatabaseWorker::BuildMetadataMaps()
+MA::Media::Type MetaDatabaseWorker::BuildMetadataMaps()
 {
     // Using MediaInfoDLL get all metadata from file.
     MediaInfoDLL::MediaInfo media_info_file;
     size_t media_file = media_info_file.Open(file_path);
     //qDebug() << "Summarized Raw Data -> " << media_info_file.Inform();
     if (not media_info_file.IsReady()) {
-        return MA::Type::Unknown;
+        return MA::Media::Type::Unknown;
     }
     for (int stream_type = 0; stream_type < MediaInfoDLL::stream_t::Stream_Max; stream_type++) {
         MediaInfoDLL::stream_t stream_kind = static_cast<MediaInfoDLL::stream_t>(stream_type);
@@ -403,14 +409,11 @@ MA::Type MetaDatabaseWorker::BuildMetadataMaps()
             int preferred_param_alt = 0;
             std::wstring last_param;
 
-
-
             // Add "additional database field" that distinguishes between video and image streams/types in Graphic's table.
             if (stream_kind == MediaInfoDLL::stream_t::Stream_Video or stream_kind == MediaInfoDLL::stream_t::Stream_Image) {
-                MA::Type stream_type = MA::MediaTypes::fromMediaInfoStreamKind(stream_kind);
+                MA::Media::Type stream_type = MA::Media::fromMediaInfoStreamKind(stream_kind);
                 PlaceKeyValuePairIntoCorrectMap({ Field::Graphic::Type, stream_type }, stream_kind, stream);
             }
-
             
             for (int p = 0; p < param_count; p++) {
                 //QString param = QString::fromStdWString(media_info_file.Get(stream_kind, 2, p, MediaInfoDLL::Info_Name).c_str()); // Blank?
@@ -460,19 +463,19 @@ MA::Type MetaDatabaseWorker::BuildMetadataMaps()
     }*/
 
     // Get media type and filter based on metadata gathered. 
-    //if (media_filters == MA::Type::Unknown) { // Skips on duplicate_file_found
+    //if (media_filters == MA::Media::Type::Unknown) { // Skips on duplicate_file_found
     if (not duplicate_file_found) {
         if (general_metadata_maps.size())
-            media_filters = MA::Type::Other;
+            media_filters = MA::Media::Type::Other;
         if (video_metadata_maps.size())
-            media_filters |= MA::Type::Video;
+            media_filters |= MA::Media::Type::Video;
         if (audio_metadata_maps.size())
-            media_filters |= MA::Type::Audio;
+            media_filters |= MA::Media::Type::Audio;
         if (music_metadata_maps.size())
-            media_filters |= MA::Type::Music;
+            media_filters |= MA::Media::Type::Music;
         if (image_metadata_maps.size())
-            media_filters |= MA::Type::Image;
-        media_type = MA::getTypeFromFilter(media_filters);
+            media_filters |= MA::Media::Type::Image;
+        media_type = MA::Media::getTypeFromFilter(media_filters);
     }
 
 
@@ -656,6 +659,7 @@ MetaDatabaseWorker::KeyValuePair MetaDatabaseWorker::GetProperKeyAndValue(std::w
         }*/
         else if (key == MEDIA_INFO::GENERAL::FORMAT) {
             new_key = Field::General::Format;
+            file_format = new_val.toString();
         }
         else if (key == MEDIA_INFO::GENERAL::FORMAT_PROFILE) { // Video Table
             new_key = Field::General::FormatInfo;
@@ -1156,28 +1160,32 @@ void MetaDatabaseWorker::CreateThumbnailImages()
 
     // TODO: user setting - user direct path to custom image
     // TODO: Based on above use this to search for more images based on each file (in current directory) without a thumbnail.
-    //       Search that "direct path", parrent, and sub-dirs of parent if it matches the same name as the parent of "direct path"
+    //       Search that "direct path", parent, and sub-dirs of parent if it matches the same name as the parent of "direct path"
     
 
     // Note: Don't create and save more of the same thumbnail if dupe, but still get any different thumbnail paths. (TODO: use correct path and fall back to original dupe thumbnail path if not found)
-    if ((MA::Type::Video | MA::Type::Image | MA::Type::Music) & media_filters and not duplicate_file_found) {
+    if ((MA::Media::Type::Video | MA::Media::Type::Image | MA::Media::Type::Music) & media_filters and not duplicate_file_found) {
     
         //int duration;
         int thumbnail_count;
         int frame_interval;
         int skip_frames_above;
+        long max_frames = user_settings.getUserSetting(Field::Settings::MaxFramesToSearch).toLongLong();
 
-        if (media_filters & MA::Type::Video) {
+        if (media_filters & MA::Media::Type::Video) {
             // TODO: Backup/Alt: do some math and get maximum frames in video, use it to set frame_interval.
             //       If frames not in metadata, get duration and frame rate. else guess based on file size.  duration / 30 FPS?
             //       Even if FPS is wrong it should get close to the right number of thumbnails spread across the video.
             //duration = general_metadata_maps.at(0)->at(Field::General::Duration).toInt();
-            if (general_metadata_maps.at(0)->contains(Field::Graphic::FrameCount) and general_metadata_maps.at(0)->at(Field::Graphic::FrameCount).isValid())
+            if (general_metadata_maps.at(0)->contains(Field::Graphic::FrameCount) and general_metadata_maps.at(0)->at(Field::Graphic::FrameCount).isValid()) {
                 frame_count = general_metadata_maps.at(0)->at(Field::Graphic::FrameCount).toInt();
+            }
             else if (frame_count == 0) {
                 qWarning() << "WARNING: Missing frame_count, need alt why to create 'frame_interval'";
             }
             thumbnail_count = user_settings.getUserSetting(Field::Settings::VideoThumbnailCount).toInt();
+            if (frame_count > max_frames)
+                frame_count = max_frames;
             frame_interval = frame_count / (thumbnail_count + 1);
             skip_frames_above = frame_count - frame_interval;
 
@@ -1198,45 +1206,56 @@ void MetaDatabaseWorker::CreateThumbnailImages()
 
         frame = av_frame_alloc();
         packet = av_packet_alloc();
-        if (!frame || !packet) {
+        if (!frame or !packet) {
             qDebug() << "Could not allocate frame or packet";
         }
         else {
             // 
             if ((return_value = LoadInAVContexts(file_path.string().c_str())) > -1) {
-                    while (av_read_frame(fmt_ctx, packet) >= 0) {
-                        if (packet->stream_index == video_stream_index) {
+                while (av_read_frame(format_context, packet) >= 0) {
+                    if (packet->stream_index == video_stream_index) {
 
-                            // Skip last thumbnail, else it will be a frame near the end of video.
-                            if (dec_ctx->frame_num < skip_frames_above) {
+                        // Skip last thumbnail, else it will be a frame near the very end of video.
+                        if (decoder_context->frame_num < skip_frames_above) {
 
-                                rgb_frame = DecodeFrame(dec_ctx, frame, packet, frame_interval);
-                                if (rgb_frame) {
-                                    //QImage thumbnail_image = FrameToImage(rgb_frame);
-                                    //thumbnail_images.push_back(thumbnail_image);
-                                    //thumbnail_pixmap->convertFromImage(thumbnail_image);
-
-                                    QPixmap* thumbnail_pixmap = FrameToPixmap(rgb_frame);
-                                    thumbnail_images.push_back(*thumbnail_pixmap);
-                                    av_frame_free(&rgb_frame);
-                                    delete thumbnail_pixmap;
-                                }
+                            rgb_frame = DecodeFrame(decoder_context, frame, packet, frame_interval);
+                            if (rgb_frame) {
+                                QPixmap* thumbnail_pixmap = FrameToPixmap(rgb_frame);
+                                thumbnail_images.push_back(*thumbnail_pixmap);
+                                //av_frame_free(&rgb_frame);
+                                delete thumbnail_pixmap;
                             }
-                            else {
-                                av_packet_unref(packet);
-                                break;
-                            }
+                            // Is this unnecessary?
+                            av_frame_free(&rgb_frame);
+                            delete rgb_frame;
+                            av_frame_free(&frame);
+                            delete frame;
+                            frame = av_frame_alloc();//
                         }
-                        av_packet_unref(packet);
+                        else {
+                            av_packet_unref(packet);
+                            break;
+                        }
                     }
+                    av_packet_unref(packet);
+
+                    // Is this unnecessary?
+                    av_packet_free(&packet);
+                    delete packet;
+                    packet = av_packet_alloc();//
+                }
             }
-            avcodec_free_context(&dec_ctx);
-            avformat_close_input(&fmt_ctx);
+            avcodec_free_context(&decoder_context);
+            avformat_close_input(&format_context);
+            avformat_free_context(format_context);
         }
-        //else { // If file doesn't open...
 
         av_frame_free(&frame);
         av_packet_free(&packet);
+        delete frame;
+        delete packet;
+        delete decoder_context;
+        delete format_context;
 
         if (return_value < 0 and return_value != AVERROR_EOF) {
             qWarning() << "ERROR: AV Loading Error:" << return_value;
@@ -1257,11 +1276,11 @@ void MetaDatabaseWorker::CreateThumbnailImages()
         }
     }
 
-    if (media_type & MA::Type::Image) {
+    if (media_type & MA::Media::Type::Image) {
         thumbnail_path = QString::fromStdString(file_path.string());
     }
     // TODO: Always look for image on disk to use for thumbnail or only when none created/found from file?  user setting?  thumbnail_data.isEmpty() 
-    else if (media_type > MA::Type::Other) {
+    else if (media_type > MA::Media::Type::Other) {
         // Search in the file's current and parent directory for files named: folder, cover, front, etc and extensions jpg, png, etc.
         std::filesystem::path thumbnail_link;
         for (auto const& dir_entry : std::filesystem::recursive_directory_iterator{ file_path.parent_path(), std::filesystem::directory_options::skip_permission_denied }) {
@@ -1301,32 +1320,32 @@ void MetaDatabaseWorker::CreateThumbnailImages()
 int MetaDatabaseWorker::LoadInAVContexts(const char* file_path_char, int force_jpeg_codec_for_embedded_stream, bool embedded_file_saved)
 {
     int return_value;
-    const AVCodec* dec;
+    const AVCodec* decoder;
 
-    fmt_ctx = avformat_alloc_context();
+    format_context = avformat_alloc_context();
 
-    if ((return_value = avformat_open_input(&fmt_ctx, file_path_char, NULL, NULL)) < 0) {
+    if ((return_value = avformat_open_input(&format_context, file_path_char, NULL, NULL)) < 0) {
         qWarning() << "ERROR: failed to open input file";
         return return_value;
     }
 
     // Force jpeg codec if missing context.
     if (force_jpeg_codec_for_embedded_stream > -1) {
-        fmt_ctx->streams[force_jpeg_codec_for_embedded_stream]->codecpar->codec_id = AV_CODEC_ID_MJPEG;
+        format_context->streams[force_jpeg_codec_for_embedded_stream]->codecpar->codec_id = AV_CODEC_ID_MJPEG;
     }
 
-    if ((return_value = avformat_find_stream_info(fmt_ctx, NULL)) < 0) {
+    if ((return_value = avformat_find_stream_info(format_context, NULL)) < 0) {
         qWarning() << "ERROR: failed to find stream information";
         return return_value;
     }
     
     /*// Alt video stream finder
-    for (int i = 0; i < fmt_ctx->nb_streams; i++) {
+    for (int i = 0; i < format_context->nb_streams; i++) {
 
-        if (fmt_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+        if (format_context->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
             // Find the decoder for the video stream
-            dec = avcodec_find_decoder(fmt_ctx->streams[i]->codecpar->codec_id); //AV_CODEC_ID_PNG  AV_CODEC_ID_MJPEG
-            if (dec == NULL) {
+            decoder = avcodec_find_decoder(format_context->streams[i]->codecpar->codec_id); //AV_CODEC_ID_PNG  AV_CODEC_ID_MJPEG
+            if (decoder == NULL) {
                 fprintf(stderr, "Unsupported codec!\n");
                 return -1; // Codec not found
             }
@@ -1335,7 +1354,7 @@ int MetaDatabaseWorker::LoadInAVContexts(const char* file_path_char, int force_j
         }
     }//*/
 
-    return_value = av_find_best_stream(fmt_ctx, AVMediaType::AVMEDIA_TYPE_VIDEO, -1, -1, &dec, 0);
+    return_value = av_find_best_stream(format_context, AVMediaType::AVMEDIA_TYPE_VIDEO, -1, -1, &decoder, 0);
     if (return_value < 0) {
         qWarning() << "ERROR: failed to find a video stream in the input file";
         return return_value;
@@ -1343,11 +1362,12 @@ int MetaDatabaseWorker::LoadInAVContexts(const char* file_path_char, int force_j
     video_stream_index = return_value;
 
     // If no useful context found for an image, try forcing jpeg codec. (sometimes PNG images are embedded, but are actually Jpegs)
-    if (force_jpeg_codec_for_embedded_stream == -1 and fmt_ctx->streams[video_stream_index]->codecpar->format == -1)
+    if (force_jpeg_codec_for_embedded_stream == -1 and format_context->streams[video_stream_index]->codecpar->format == -1) {
         return LoadInAVContexts(file_path_char, video_stream_index);
+    }
 
     /*/ Alt or back up option: Not enough useful context to modify image, saving image to disk to be loaded back in.
-    if (embedded_file_saved and fmt_ctx->streams[video_stream_index]->codecpar->format == -1) {
+    if (embedded_file_saved and format_context->streams[video_stream_index]->codecpar->format == -1) {
         qDebug() << "Last resort, keep image on disk and load from image file when needed for thumbnail.";
         return -1;
     }
@@ -1355,15 +1375,15 @@ int MetaDatabaseWorker::LoadInAVContexts(const char* file_path_char, int force_j
         std::filesystem::path embed_file_path = (file_path.parent_path() / "embedded.jpg").make_preferred();
         std::filesystem::remove(embed_file_path);
     }
-    else if (fmt_ctx->streams[video_stream_index]->codecpar->format == -1) {
-        if (fmt_ctx->streams[video_stream_index]->attached_pic.size) {
+    else if (format_context->streams[video_stream_index]->codecpar->format == -1) {
+        if (format_context->streams[video_stream_index]->attached_pic.size) {
 
             std::filesystem::path embed_file_path = (file_path.parent_path() / "embedded.jpg").make_preferred();
             std::string embed_file_path_str = embed_file_path.string();
             const char* embed_file_path_c = embed_file_path_str.c_str();
 
             if (not std::filesystem::exists(embed_file_path)) {
-                AVPacket packet = fmt_ctx->streams[video_stream_index]->attached_pic;
+                AVPacket packet = format_context->streams[video_stream_index]->attached_pic;
                 FILE* image_file = fopen(embed_file_path_c, "wb");
                 int result = fwrite(packet.data, packet.size, 1, image_file);
                 fclose(image_file);
@@ -1376,32 +1396,50 @@ int MetaDatabaseWorker::LoadInAVContexts(const char* file_path_char, int force_j
     /*/ Packet Save Test
     AVPacket* packet;
     packet = av_packet_alloc();
-    av_read_frame(fmt_ctx, packet);
+    av_read_frame(format_context, packet);
     FILE* image_file = fopen("embedded.jpg", "wb");
     int result = fwrite(packet->data, packet->size, 1, image_file);
     fclose(image_file);//*/
     
-    dec_ctx = avcodec_alloc_context3(dec);
-    if (!dec_ctx) {
+    decoder_context = avcodec_alloc_context3(decoder);
+    if (!decoder_context) {
         qWarning() << "ERROR: failed to allocate decoding context/memory";
         return AVERROR(ENOMEM);
     }
 
-    avcodec_parameters_to_context(dec_ctx, fmt_ctx->streams[video_stream_index]->codecpar);
+    avcodec_parameters_to_context(decoder_context, format_context->streams[video_stream_index]->codecpar);
+
+    /** Determine how many threads best suited for the decoding job. (Huge Speedup!)
+      * Which multithreading methods to use.
+      * Use of FF_THREAD_FRAME will increase decoding delay by one frame per thread,
+      * so clients which cannot provide future frames should not use it.
+      *
+      * - encoding: Set by user, otherwise the default is used.
+      * - decoding: Set by user, otherwise the default is used.
+      */
+    decoder_context->thread_count = 0;
+    if (media_type & MA::Media::Image)// or file_format == "WebP" or file_extension == ".webp") // Note: Most images can still work with FF_THREAD_FRAME, but WebP images only work with FF_THREAD_SLICE.
+        decoder_context->thread_type = FF_THREAD_SLICE;
+    else if (decoder->capabilities & AV_CODEC_CAP_FRAME_THREADS)
+        decoder_context->thread_type = FF_THREAD_FRAME; // Decode more than one frame at once
+    else if (decoder->capabilities & AV_CODEC_CAP_SLICE_THREADS)
+        decoder_context->thread_type = FF_THREAD_SLICE; // Decode more than one part of a single frame at once
+    else
+        decoder_context->thread_count = 1; // Don't use multithreading
 
     // Initiate the video decoder
-    if ((return_value = avcodec_open2(dec_ctx, dec, NULL)) < 0) {
+    if ((return_value = avcodec_open2(decoder_context, decoder, NULL)) < 0) {
         qWarning() << "ERROR: failed to open video decoder";
         return return_value;
     }
-
+    
     return 0;
 }
 
-AVFrame* MetaDatabaseWorker::DecodeFrame(AVCodecContext* codec_ctx, AVFrame* frame, AVPacket* packet, int mod)
+AVFrame* MetaDatabaseWorker::DecodeFrame(AVCodecContext* codec_context, AVFrame* frame, AVPacket* packet, int mod)
 {
     // Send packet to decoder
-    int return_value = avcodec_send_packet(codec_ctx, packet);
+    int return_value = avcodec_send_packet(codec_context, packet);
     if (return_value < 0) {
         qDebug() << "ERROR: error sending packet for decoding";
         switch (errno) {
@@ -1426,8 +1464,8 @@ AVFrame* MetaDatabaseWorker::DecodeFrame(AVCodecContext* codec_ctx, AVFrame* fra
     int media_item_size = user_settings.getUserSetting(Field::Settings::MediaItemStorageSize).toInt();;
 
     // Scale image keeping aspect ratio
-    int scaled_width = codec_ctx->width;
-    int scaled_height = codec_ctx->height;
+    int scaled_width = codec_context->width;
+    int scaled_height = codec_context->height;
     if (scaled_width > scaled_height) {
         scaled_height = scaled_height / (scaled_width / media_item_size);
         scaled_width = media_item_size;
@@ -1441,35 +1479,41 @@ AVFrame* MetaDatabaseWorker::DecodeFrame(AVCodecContext* codec_ctx, AVFrame* fra
         scaled_height = media_item_size;
     }
 
-    // Get frame back from decoder - (put this back if problems arise later [if (return_value >= 0)])
-    return_value = avcodec_receive_frame(codec_ctx, frame);
+    // Get frame back from decoder
+    return_value = avcodec_receive_frame(codec_context, frame);
 
     // If resource temporaily not available or end of file reached, error out.
     if (return_value == AVERROR(EAGAIN) || return_value == AVERROR_EOF) {
         return nullptr; // Can still go again if more frames available
     }
     else if (return_value < 0) {
-        qWarning() << "ERROR: Frame decoding failure, failed to receive frame.";
+        qWarning() << "ERROR: Frame decoding failure, failed to receive frame. Code:" << return_value;
         return nullptr;
+    }
+
+    // Stopping here if this frame is not needed... next.
+    if (codec_context->frame_num % mod > 0) {
+        return nullptr; // Note: Frame has advanced and next frame can be read at this point.
     }
 
     AVPixelFormat src_format = (AVPixelFormat)frame->format;
     AVPixelFormat dst_format = AV_PIX_FMT_RGB24;
 
     // Create a scalar context for conversion
-    //SwsContext* sws_ctx = sws_getContext(codec_ctx->width, codec_ctx->height, codec_ctx->pix_fmt, scaled_width, scaled_height, dst_format, SWS_BICUBIC, NULL, NULL, NULL);
-    SwsContext* sws_ctx = sws_getContext(frame->width, frame->height, src_format, scaled_width, scaled_height, dst_format, SWS_BICUBIC, NULL, NULL, NULL);
+    //SwsContext* scale_context = sws_getContext(codec_context->width, codec_context->height, codec_context->pix_fmt, scaled_width, scaled_height, dst_format, SWS_BICUBIC, NULL, NULL, NULL);
+    SwsContext* scale_context = sws_getContext(frame->width, frame->height, src_format, scaled_width, scaled_height, dst_format, SWS_BICUBIC, NULL, NULL, NULL);
 
-    if (sws_ctx == nullptr) {
+    if (scale_context == nullptr) {
         qWarning() << "ERROR: Missing image context, scaling failed.";
-         return nullptr;
+        sws_freeContext(scale_context);
+        return nullptr;
     }
 
     // Create a new RGB frame for conversion
     AVFrame* rgb_frame = av_frame_alloc();
     rgb_frame->format = dst_format;
     /////rgb_frame->format = AV_PIX_FMT_RGB24;
-    //rgb_frame->format = codec_ctx->pix_fmt;
+    //rgb_frame->format = codec_context->pix_fmt;
     //rgb_frame->format = AV_PIX_FMT_RGB32;
     //rgb_frame->format = AV_PIX_FMT_YUV420P;
     //rgb_frame->format = AV_PIX_FMT_YUV440P;
@@ -1480,7 +1524,7 @@ AVFrame* MetaDatabaseWorker::DecodeFrame(AVCodecContext* codec_ctx, AVFrame* fra
     rgb_frame->height = scaled_height;
     
     // Allocate a new buffer for the RGB conversion frame
-    av_frame_get_buffer(rgb_frame, 0);
+    return_value = av_frame_get_buffer(rgb_frame, 0);
 
     /*/ Alt: prepare line sizes structure  and char buffer in array... as sws_scale expects
     int rgb_linesizes[8] = { 0 };
@@ -1491,46 +1535,48 @@ AVFrame* MetaDatabaseWorker::DecodeFrame(AVCodecContext* codec_ctx, AVFrame* fra
     if (!rgb_data[0]) {
         qDebug() << "Error allocating buffer for frame conversion";
         free(rgb_data[0]);
-        sws_freeContext(sws_ctx);
+        sws_freeContext(scale_context);
         return nullptr;
     }//*/
 
-    // Run while frames are available with no errors
+    // Scale frame, if available, with no errors.
     if (return_value >= 0) {
 
-        // Get only the (mod)'th frame...
-        if (codec_ctx->frame_num % mod == 0) {
-            qDebug().nospace() << "Decoding frame #" << codec_ctx->frame_num;
+        qDebug().nospace() << "Decoding frame #" << codec_context->frame_num;
 
-            // Scale/Convert the old frame to the new RGB frame
-            sws_scale(sws_ctx, frame->data, frame->linesize, 0, frame->height, rgb_frame->data, rgb_frame->linesize);
+        // Scale/Convert the old frame to the new RGB frame.
+        sws_scale(scale_context, frame->data, frame->linesize, 0, frame->height, rgb_frame->data, rgb_frame->linesize);
             
-            /*/ Alt
-            sws_scale(sws_ctx, frame->data, frame->linesize, 0, frame->height, rgb_data, rgb_linesizes);
-            QImage image(scaled_width, scaled_height, QImage::Format::Format_RGB888); // AV_PIX_FMT_YUVJ444P to AV_PIX_FMT_RGB24
-            for (size_t y = 0; y < scaled_height; y++) {
-                memcpy(image.scanLine(y), rgb_data[0] + y * rgb_linesizes[0], 3 * scaled_width);
-            }
-            image.save("test.jpg");//*/
-
-            /*/ Frame Test Save
-            FILE* pFile;
-            char szFilename[32];
-            //sprintf(szFilename, "frame%d.ppm", 1);
-            sprintf(szFilename, "frame%d.jpg", 1);
-            pFile = fopen(szFilename, "wb");
-            if (pFile == NULL)
-                return nullptr;
-            // Write header
-            fprintf(pFile, "P6\n%d %d\n255\n", rgb_frame->width, rgb_frame->height);
-            // Write pixel data
-            for (int y = 0; y < rgb_frame->height; y++)
-                fwrite(rgb_frame->data[0] + y * rgb_frame->linesize[0], 1, rgb_frame->width * 3, pFile);
-            fclose(pFile);//*/
-
-            return rgb_frame;
+        /*/ Alt
+        sws_scale(scale_context, frame->data, frame->linesize, 0, frame->height, rgb_data, rgb_linesizes);
+        QImage image(scaled_width, scaled_height, QImage::Format::Format_RGB888); // AV_PIX_FMT_YUVJ444P to AV_PIX_FMT_RGB24
+        for (size_t y = 0; y < scaled_height; y++) {
+            memcpy(image.scanLine(y), rgb_data[0] + y * rgb_linesizes[0], 3 * scaled_width);
         }
+        image.save("test.jpg");//*/
+
+        /*/ Frame Test Save
+        FILE* pFile;
+        char szFilename[32];
+        //sprintf(szFilename, "frame%d.ppm", 1);
+        sprintf(szFilename, "frame%d.jpg", 1);
+        pFile = fopen(szFilename, "wb");
+        if (pFile == NULL)
+            return nullptr;
+        // Write header
+        fprintf(pFile, "P6\n%d %d\n255\n", rgb_frame->width, rgb_frame->height);
+        // Write pixel data
+        for (int y = 0; y < rgb_frame->height; y++)
+            fwrite(rgb_frame->data[0] + y * rgb_frame->linesize[0], 1, rgb_frame->width * 3, pFile);
+        fclose(pFile);//*/
+
+        sws_freeContext(scale_context);
+        return rgb_frame;
     }
+    qWarning() << "ERROR: Failed to allocate buffer for RGB frame. Error Code:" << return_value;
+    sws_freeContext(scale_context);
+    av_frame_free(&rgb_frame);
+    delete rgb_frame;
     return nullptr;
 }
 
@@ -1556,7 +1602,7 @@ QImage MetaDatabaseWorker::FrameToImage(const AVFrame* frame) const
         frame->width,
         frame->height,
         (AVPixelFormat)frame->format,
-        //(AVPixelFormat)dec_ctx->pix_fmt,
+        //(AVPixelFormat)decoder_context->pix_fmt,
         frame->width,
         frame->height,
         AV_PIX_FMT_RGB24,
@@ -1600,7 +1646,7 @@ QImage MetaDatabaseWorker::FrameToImage(const AVFrame* frame) const
     //*/
     // then create QImage and copy converted frame data into it
 
-    //QImage image(frame->data[0], dec_ctx->width, dec_ctx->height, frame->linesize[0], QImage::Format_RGB888);
+    //QImage image(frame->data[0], decoder_context->width, decoder_context->height, frame->linesize[0], QImage::Format_RGB888);
     QImage image(frame->width, frame->height, QImage::Format::Format_RGB888);
 
     for (int y = 0; y < frame->height; y++) {
@@ -1830,7 +1876,7 @@ QString MetaDatabaseWorker::BuildDatabaseUpdateQueryString(std::map<QString, QVa
                 continue;
             }
             else if (table == Table::UserMeta and metadata.first == Field::UserMeta::UserId) {
-                update.append(QString("\"%1\" = %2 AND ").arg(metadata.first).arg(user_id));
+                where_id.append(QString("\"%1\" = %2 AND ").arg(metadata.first).arg(user_id));
                 continue;
             }
             else {

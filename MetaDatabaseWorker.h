@@ -85,8 +85,8 @@ private:
     time_t file_date_modified = 0;
     int frame_count = 0;
     QString file_format = "";
-    MA::Type media_type = MA::Type::Unknown;
-    int media_filters = MA::Type::Unknown;
+    MA::Media::Type media_type = MA::Media::Type::Unknown;
+    int media_filters = MA::Media::Type::Unknown;
     int update_filter = MA::Update::Nothing;
     long long video_thumbnail_max_file_size = 20971520; // 20 mb
     //const long long non_video_thumbnail_max_file_size = 104857600; // 100 mb, TODO: user setting?
@@ -113,7 +113,7 @@ private:
     bool ExistsInDatabase(QString table = Table::General);
     void SendMetadataToMediaItem();
 
-    MA::Type BuildMetadataMaps();
+    MA::Media::Type BuildMetadataMaps();
     QVariant SterilizeValue(std::wstring value);
     KeyValuePair GetProperKeyAndValue(const std::wstring key, const std::wstring value, const MediaInfoDLL::stream_t stream_kind);
     bool PlaceKeyValuePairIntoCorrectMap(KeyValuePair key_value_pair, MediaInfoDLL::stream_t stream_kind, int stream);
