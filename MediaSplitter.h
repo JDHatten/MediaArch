@@ -21,6 +21,8 @@ public:
     void insertWidget(int index, QWidget* widget, bool lock_resizing = false, bool allow_handle_resizing = false);
     bool isResizing() const;
     void setIsResizing(bool resizing);
+    bool restoreState(const QByteArray& state);
+    void setSizes(const QList<int>& sizes);
     void lockWidgetResizing(int index, bool allow_handle_resizing = false);
     bool isWidgetCollapsed(int index);
 
