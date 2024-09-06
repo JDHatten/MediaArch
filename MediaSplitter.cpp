@@ -27,11 +27,11 @@ void MediaSplitter::insertWidget(int index, QWidget* widget, bool lock_resizing,
 void MediaSplitter::SplitterMoving(int position, int right_widget_index)
 {
     int  left_widget_index = right_widget_index - 1;
-    bool left_widget_collapsed = widget(left_widget_index)->property(Properties::Splitter::Collapsed).toBool();
+    bool left_widget_collapsed = widget(left_widget_index)->property(MA::Property::Collapsed).toBool();
     bool left_widget_visible = widget(left_widget_index)->visibleRegion().isEmpty();
-    bool right_widget_collapsed = widget(right_widget_index)->property(Properties::Splitter::Collapsed).toBool();
+    bool right_widget_collapsed = widget(right_widget_index)->property(MA::Property::Collapsed).toBool();
     bool right_widget_visible = widget(right_widget_index)->visibleRegion().isEmpty();
-    //
+    /*/
     qDebug() << "SplitterMoving (indexes:" << left_widget_index << "<>" << right_widget_index
         << " |  position:" << position
         << " |  collapsed:" << left_widget_visible
@@ -41,22 +41,22 @@ void MediaSplitter::SplitterMoving(int position, int right_widget_index)
         setIsResizing(true);
     }
     if (not left_widget_collapsed && left_widget_visible) {
-        widget(left_widget_index)->setProperty(Properties::Splitter::Collapsed, true);
+        widget(left_widget_index)->setProperty(MA::Property::Collapsed, true);
         emit widgetCollapsed(left_widget_index);
         qDebug() << "Splitter widget collapsed at index:" << left_widget_index;
     }
     else if (left_widget_collapsed && not left_widget_visible) {
-        widget(left_widget_index)->setProperty(Properties::Splitter::Collapsed, false);
+        widget(left_widget_index)->setProperty(MA::Property::Collapsed, false);
         emit widgetRestored(left_widget_index);
         qDebug() << "Splitter widget restored at index:" << left_widget_index;
     }
     else if (not right_widget_collapsed && right_widget_visible) {
-        widget(right_widget_index)->setProperty(Properties::Splitter::Collapsed, true);
+        widget(right_widget_index)->setProperty(MA::Property::Collapsed, true);
         emit widgetCollapsed(right_widget_index);
         qDebug() << "Splitter widget collapsed at index:" << right_widget_index;
     }
     else if (right_widget_collapsed && not right_widget_visible) {
-        widget(right_widget_index)->setProperty(Properties::Splitter::Collapsed, false);
+        widget(right_widget_index)->setProperty(MA::Property::Collapsed, false);
         emit widgetRestored(right_widget_index);
         qDebug() << "Splitter widget restored at index:" << right_widget_index;
     }
@@ -87,6 +87,21 @@ void MediaSplitter::setIsResizing(bool resizing)
     }
 }
 
+bool MediaSplitter::restoreState(const QByteArray& state)
+{
+    setIsResizing(true);
+    bool state_restored = QSplitter::restoreState(state);
+    setIsResizing(false);
+    return state_restored;
+}
+
+void MediaSplitter::setSizes(const QList<int>& sizes)
+{
+    setIsResizing(true);
+    QSplitter::setSizes(sizes);
+    setIsResizing(false);
+}
+
 void MediaSplitter::lockWidgetResizing(int index, bool allow_handle_resizing)
 {
     if (count()) {
@@ -109,29 +124,20 @@ void MediaSplitter::lockWidgetResizing(int index, bool allow_handle_resizing)
 
 bool MediaSplitter::isWidgetCollapsed(int index)
 {
-    return widget(index)->property(Properties::Splitter::Collapsed).toBool();
+    return widget(index)->property(MA::Property::Collapsed).toBool();
 }
 
 bool MediaSplitter::event(QEvent* ms_event)
 {
-    //qDebug().nospace() << "changeEvent(" << ms_event->type() << ")";
-    /*QMouseEvent* mouse_event = dynamic_cast<QMouseEvent*>(ms_event);
-    if ((ms_event->type() == QEvent::MouseButtonRelease) || (ms_event->type() == QEvent::NonClientAreaMouseButtonRelease)) {
-        if ((mouse_event->button() == Qt::MouseButton::LeftButton)) {
-
-        }
-    }*/
     return QSplitter::event(ms_event);
 }
 
 void MediaSplitter::resizeEvent(QResizeEvent* resize_event)
 {
-    //qDebug().nospace() << "resizeEvent( " << resize_event->size() << " ) i0: " << sizes().at(0) << " or " << widget(0)->width();
     QSplitter::resizeEvent(resize_event);
 }
 
 void MediaSplitter::paintEvent(QPaintEvent* paint_event)
 {
-    //qDebug().nospace() << "paintEvent(" << paint_event->isInputEvent() << ")";
     QSplitter::paintEvent(paint_event);
 }
