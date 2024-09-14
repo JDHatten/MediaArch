@@ -12,12 +12,14 @@
 #include <QMouseEvent>
 #include <QPushButton>
 #include <QSpinBox>
+#include <QStandardItem>
 #include <QString>
 #include <QTabWidget>
 
 #include "UserSettings.h"
 #include "MediaSpaces.h"
 #include "SwitchButton.h"
+#include "DetailedViewer.h"
 
 class DialogSettings : public QDialog
 {
@@ -31,6 +33,7 @@ public:
 private:
 
     UserSettings* user_settings = nullptr;
+    DetailedViewer::ColumnLabels detailed_viewer_columns;
 
     QTabWidget* settings_tabs = nullptr;
     QWidget* general_tab = nullptr;
@@ -51,6 +54,8 @@ private:
     SwitchButton* auto_generate_thumbnail_switch = nullptr;
     QSpinBox* auto_gen_video_size_limit_spinner = nullptr;
 
+    QComboBox* viewable_metadata_columns_combo = nullptr;
+
     QDialog* custom_tooltip = nullptr;
     //QMessageBox* custom_tooltip = nullptr;
 
@@ -61,9 +66,12 @@ private:
     QLabel* CreateLabel(QWidget* parent_widget, QString text, QString tooltip = "");
     QLineEdit* CreateLineEdit(QWidget* parent_widget, QString setting);
     QComboBox* CreateComboBox(QWidget* parent_widget, QString setting, QVector<Text::Option> item_list);
+    QComboBox* CreateComboCheckBox(QWidget* parent_widget, QString setting, QVector<Text::MetadataMethod> item_list);
     QSpinBox* CreateSpinBox(QWidget* parent_widget, QString setting, int minumum = 0, int maximum = 100, int step = 1, QString suffix = "");
     SwitchButton* CreateSwitch(QWidget* parent_widget, QString setting, SwitchButton::Style style = SwitchButton::Style::YESNO);
     QPushButton* CreateButton(QWidget* parent_widget, QString text);
+
+    void UpdateComboCheckBoxOptions(QComboBox* combo_box, QStringList tables, QStringList fields);
 
 signals:
 
