@@ -14,6 +14,7 @@
 #include <QtSql/QSqlRecord>
 #include <QtSql/QSqlField>
 #include <QThread>
+#include <QWaitCondition>
 
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -47,15 +48,23 @@ class MetaDatabaseWorker : public QObject
 
 public:
 
-    struct KeyValuePair {
+    struct KeyValuePair { // TODO: use QHash?
         QString key;
         QVariant value;
     };
 
-    //MetaDatabaseWorker(std::filesystem::path file_path, int user_id, int update_filter = MA::Update::Nothing, std::map<QString, QVariant>* updated_user_meta = nullptr, QObject* parent = nullptr);
-    MetaDatabaseWorker(MediaItem* media_item, UserSettings user_settings, int update_filter = MA::Update::Nothing, std::map<QString, QVariant>* updated_user_meta = nullptr, QObject* parent = nullptr);
+    MetaDatabaseWorker(MediaItem* media_item, const UserSettings* user_settings, int update_filter = MA::Update::Nothing, std::map<QString, QVariant>* updated_user_meta = nullptr, QObject* parent = nullptr);
     ~MetaDatabaseWorker();
 
+    std::filesystem::path getFilePath();
+    QString getFileId();
+    void cancel();
+    bool isActive() const;
+    void duplicateFound();
+    bool isLargeFile() const;
+    bool isHeavyComputationInProgress() const;
+    bool isPaused() const;
+    
     /// <summary>
     /// Uses the Windows Shell's IShellLink and IPersistFile interfaces to retrieve the path and description from an existing shortcut. 
     /// </summary>
@@ -72,24 +81,29 @@ private:
 
     QSqlDatabase database;
     QMutex mutex;
+    QWaitCondition wait_condition;
+    bool paused = false;
+    bool heavy_computation_in_progress = false;
+    bool active = false;
+    bool new_duplicate_file_found = false;
     MediaItem* media_item = nullptr;
-    UserSettings user_settings;
+    const UserSettings* user_settings;
     int user_id = 0;
-    const QRegularExpression re_table_stream{ "(?<table>[a-zA-Z]+)(?<stream>\\d*)" };
     std::filesystem::path file_path;
     QString file_path_str;
+    QString file_name;
     std::string file_extension;
     QString file_id = "0";
     size_t file_size = 0;
     time_t file_date_created = 0;
     time_t file_date_modified = 0;
     int frame_count = 0;
+    int thumbnail_count = 1;
     QString file_format = "";
     MA::Media::Type media_type = MA::Media::Type::Unknown;
-    int media_filters = MA::Media::Type::Unknown;
+    int media_filter = MA::Media::Type::Unknown;
     int update_filter = MA::Update::Nothing;
     long long video_thumbnail_max_file_size = 20971520; // 20 mb
-    //const long long non_video_thumbnail_max_file_size = 104857600; // 100 mb, TODO: user setting?
     const long long non_video_thumbnail_max_file_size = 268435456; // 250 mb, TODO: user setting?
     QByteArray thumbnail_data = 0;
     QString thumbnail_path;
@@ -97,20 +111,21 @@ private:
     AVCodecContext* decoder_context = nullptr;
     int video_stream_index = -1;
 
-    // Note: There should never be multiple "General Streams/Tracks/Maps".  However, there can be multiple "General Tables" for duplicate files.
+    // Note: There are only multiple records for the same file in General (duplicate files), Video/Audio (multiple streams/tracks).
     std::vector< std::unique_ptr<std::map<QString, QVariant>> > general_metadata_maps;
     std::vector< std::unique_ptr<std::map<QString, QVariant>> > video_metadata_maps;
     std::vector< std::unique_ptr<std::map<QString, QVariant>> > audio_metadata_maps;
-    std::vector< std::unique_ptr<std::map<QString, QVariant>> > music_metadata_maps;
+    std::vector< std::unique_ptr<std::map<QString, QVariant>> > music_metadata_maps; // TODO: Multiple music records for dupe files? Can a change here be made and still be considered a dupe file?
     std::vector< std::unique_ptr<std::map<QString, QVariant>> > image_metadata_maps;
-
-    bool duplicate_file_found = false;
-    //bool update_metadata = false;
+    std::vector< std::unique_ptr<std::map<QString, QVariant>> > extended_metadata_maps;
+    
     std::map<QString, QVariant>* user_meta = nullptr;
 
+    bool WaitingLoop();
     bool GenerateFileId(bool use_265_bit_hash = false);
     bool OpenDatabase();
     bool ExistsInDatabase(QString table = Table::General);
+    bool DeleteFromDatabase(QString table);
     void SendMetadataToMediaItem();
 
     MA::Media::Type BuildMetadataMaps();
@@ -136,13 +151,19 @@ private:
 public slots:
 
     void addRecord();
+    void setPaused(bool enable);
     bool updateRecord();
     void getRecord();
 
 signals:
 
-    void databaseUpdated(MA::Database::FinishCode code);
+    void checkForDuplicate(MetaDatabaseWorker* file_check);
+    void heavyComputationStarted();
+    void heavyComputationEnded();
+    void progressMade(int steps);
+    void progressFinished(MA::Database::FinishCode code, QString file_name);
     void databaseRecordsRetrieved(std::filesystem::path file_path, std::map<QString, QSqlRecord>* table_record_map);
+    void databaseUpdated(QString file_id);
     void mediaItemUpdated(MediaItem* media_item);
 
 };
