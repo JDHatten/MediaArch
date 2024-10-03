@@ -1,14 +1,16 @@
 #include "MetaDatabaseWorker.h"
 
-MetaDatabaseWorker::MetaDatabaseWorker(MediaItem* media_item, UserSettings user_settings, int update_filter, std::map<QString, QVariant>* updated_user_meta, QObject* parent)
+MetaDatabaseWorker::MetaDatabaseWorker(MediaItem* media_item, const UserSettings* user_settings, int update_filter, std::map<QString, QVariant>* updated_user_meta, QObject* parent)
     : QObject(parent), media_item(media_item), user_settings(user_settings), update_filter(update_filter), user_meta(updated_user_meta)
 {
     MetaDatabaseWorker::file_path = media_item->getFilePath();
     MetaDatabaseWorker::file_path_str = QString::fromStdString(file_path.make_preferred().string());
+    file_name = file_path.filename().string().c_str();
     file_extension = file_path.extension().string();
     std::transform(file_extension.begin(), file_extension.end(), file_extension.begin(), tolower);
-    user_id = user_settings.getUserSetting(Field::Settings::UserId).toInt();
-    video_thumbnail_max_file_size = user_settings.getUserSetting(Field::Settings::AutoGenerateVideoSizeLimit).toLongLong() * 1024 * 1024;
+    user_id = user_settings->getUserSetting(Field::Settings::UserId).toInt();
+    video_thumbnail_max_file_size = user_settings->getUserSetting(Field::Settings::AutoGenerateVideoSizeLimit).toLongLong() * 1024 * 1024;
+    thumbnail_count = user_settings->getUserSetting(Field::Settings::VideoThumbnailCount).toInt();
     //qDebug().nospace() << "MetaDatabaseWorker Constructed (" << file_path_str << ")";
 }
 
@@ -22,94 +24,184 @@ MetaDatabaseWorker::~MetaDatabaseWorker()
     //qDebug().nospace() << "...MetaDatabaseWorker Deconstructed (" << file_path.filename().string() << ")";
 }
 
+std::filesystem::path MetaDatabaseWorker::getFilePath()
+{
+    return file_path;
+}
+
+QString MetaDatabaseWorker::getFileId()
+{
+    return file_id;
+}
+
+void MetaDatabaseWorker::cancel()
+{
+    active = false;
+}
+bool MetaDatabaseWorker::isActive() const
+{
+    return active;
+}
+
+void MetaDatabaseWorker::duplicateFound()
+{
+    setPaused(true);
+    new_duplicate_file_found = true;
+    // Delete any progress made in maps
+    general_metadata_maps.clear();
+    extended_metadata_maps.clear();
+}
+
+bool MetaDatabaseWorker::isLargeFile() const
+{
+    if (media_type & MA::Media::Type::Video and file_size > 52428800) // 50 mb, video files under this size should be processed with in few seconds at most.
+        return true;
+    if (media_type & (MA::Media::Type::Music | MA::Media::Type::Audio | MA::Media::Type::Image) and file_size > 10485760) // 10 mb
+        return true;
+    else
+        return false;
+}
+
+bool MetaDatabaseWorker::isHeavyComputationInProgress() const
+{
+    return heavy_computation_in_progress;
+}
+
+bool MetaDatabaseWorker::isPaused() const
+{
+    return paused;
+}
+void MetaDatabaseWorker::setPaused(bool enable)
+{
+    mutex.lock();
+    paused = enable;
+    if (not paused)
+        wait_condition.wakeAll();
+    mutex.unlock();
+}
+
 void MetaDatabaseWorker::addRecord()
 {
+    active = true;
     general_metadata_maps.push_back(std::make_unique<std::map<QString, QVariant>>());
+    extended_metadata_maps.push_back(std::make_unique<std::map<QString, QVariant>>());
     //general_metadata_maps.shrink_to_fit();
     MA::Database::FinishCode db_code = MA::Database::FinishCode::Failed;
 
     // Get File Id/Hash
-    if (GenerateFileId()) {
+    if (GenerateFileId() and active) {
 
-        if (OpenDatabase()) {
+        if (OpenDatabase() and active) {
 
-            if (ExistsInDatabase()) {
-                
+            // First bit of progress made (all progress: 1 + 8[BuildMetadataMaps] + thumbnail_count(8)[CreateThumbnailImages] + 1[AddToDatabase] + 1[SendMetadataToMediaItem] + 1[progressFinished] = 20)
+            emit progressMade(1);
+
+            if (ExistsInDatabase() and active) {
+
                 if ((MA::Update::Metadata | MA::Update::SmallFileThumbnails | MA::Update::AllFileThumbnails) & update_filter or user_meta) {
 
-                    // Update only thumbnails?
                     if (MA::Update::Metadata & update_filter) {
                         media_type = BuildMetadataMaps();
-                        //qDebug().nospace() << "This '" << MA::printType(media_type) << "' file already exists in the database, but it will be updated.";
+                    }
+                    else {
+                        ExistsInDatabase(Table::Extended); // Makes sure to at least set media_filter, media_type
                     }
 
-                    // TODO: by default always get "small file thumbnails"   user setting: how big is a "small file"
                     if (MA::Update::AllFileThumbnails & update_filter) {
                         CreateThumbnailImages();
                     }
                     else if (MA::Update::SmallFileThumbnails & update_filter) {
+
                         if (media_type & MA::Media::Type::Video and file_size < video_thumbnail_max_file_size)
                             CreateThumbnailImages();
+
                         else if (media_type != MA::Media::Type::Video and file_size < non_video_thumbnail_max_file_size)
                             CreateThumbnailImages();
                     }
-                    
-                    if (duplicate_file_found) {
+
+                    if (new_duplicate_file_found) { // Note: True if a newly found dupe file is not in database yet, but the original is (Only on first load of dupe).
+                        
+                        emit progressMade(thumbnail_count); // Skipping CreateThumbnailImages  (TODO: Is there anyway to know ahead of time what will be skipped and therefore not add unneeded progress steps?)
+
                         if (AddToDatabase()) {
                             db_code = MA::Database::FinishCode::NewDuplicateAdded;
-                            //getRecord();
                             SendMetadataToMediaItem();
-                        }
-                        else {
-                            // TODO: Inform user of error and how to possibly fix it.
                         }
                     }
                     else {
                         if (UpdateDatabase()) {
                             db_code = MA::Database::FinishCode::Updated;
-                            //getRecord();
                             SendMetadataToMediaItem();
-                        }
-                        else {
-                            // TODO: Inform user of error and how to possibly fix it.
                         }
                     }
                 }
                 else {
-                    //qDebug().nospace() << "This file already exist in the database and no update is required.";
+                    emit progressMade(8); // Skipping BuildMetadataMaps +...
                     db_code = MA::Database::FinishCode::AlreadyExisted;
-                    //getRecord();
                     SendMetadataToMediaItem();
+                    emit progressMade(thumbnail_count + 1); // Skipping ...CreateThumbnailImages + UpdateDatabase
                 }
             }
-            else {
+            else if (active) {
+
+                // Check if this "file_id" is currently being added to the database (duplicate files found in the same directory)
+                emit checkForDuplicate(this);
+                
+                if (new_duplicate_file_found) { // TODO: will this always catch the next dupe file in time?
+                    WaitingLoop(); // Wait until the original file is added to the database (databaseUpdated signal)...
+                    emit progressMade(-1);
+                    addRecord(); // Then re-add file as an existing/duplicate file
+                    return;
+                }
+
                 media_type = BuildMetadataMaps();
-                //qDebug().nospace() << "This '" << MA::printType(media_type) << "' file will be added to database.";
 
                 if (media_type & MA::Media::Type::Video and file_size < video_thumbnail_max_file_size)
                     CreateThumbnailImages();
+
                 else if (media_type != MA::Media::Type::Video and file_size < non_video_thumbnail_max_file_size)
                     CreateThumbnailImages();
+                else
+                    emit progressMade(thumbnail_count); // Skipping CreateThumbnailImages
 
                 if (AddToDatabase()) {
                     db_code = MA::Database::FinishCode::NewlyAdded;
-                    //getRecord();
                     SendMetadataToMediaItem();
-                }
-                else {
-                    // TODO: Inform user of error and how to possibly fix it.
                 }
             }
         }
+        else
+            emit progressMade(8 + thumbnail_count + 3); // Skipping All
     }
+    else
+        emit progressMade(8 + thumbnail_count + 3); // Skipping All
+
+    if (not active)
+        db_code = MA::Database::FinishCode::Canceled;
 
     // Emit Code (Newly Added, Updated, Already Existed, Failed, New Duplicate Added)
-    emit databaseUpdated(db_code);
+    emit progressFinished(db_code, file_name);
+}
+
+bool MetaDatabaseWorker::WaitingLoop()
+{
+    while (1) {
+        mutex.lock();
+        if (paused) {
+            wait_condition.wait(&mutex);
+        }
+        else {
+            mutex.unlock();
+            return paused;
+        }
+        mutex.unlock();
+    }
+    return paused;
 }
 
 bool MetaDatabaseWorker::updateRecord()
 {
-    // TODO: 
+    // not used
     return false;
 }
 
@@ -149,7 +241,7 @@ void MetaDatabaseWorker::getRecord()
                         track_num++;
                         /*/
                         for (int i = 0; i < record.count(); i++) {
-                            if (record.fieldName(i) == Field::General::ThumbnailData) continue;
+                            if (record.fieldName(i) == Field::Extended::ThumbnailData) continue;
                             qDebug().nospace() << ">>" << table_str << " (" << record.count() << ") :: " << record.fieldName(i) << " : " << record.value(i);
                         }//*/
                     }
@@ -181,6 +273,8 @@ void MetaDatabaseWorker::SendMetadataToMediaItem()
 
             for (auto& table : DatabaseSchema::getAllTables(true)) {
 
+                if (not active) return;
+
                 if (update_only_user_meta and table != Table::UserMeta)
                     continue; // Only update media_item with user meta, skip the rest.
 
@@ -195,6 +289,9 @@ void MetaDatabaseWorker::SendMetadataToMediaItem()
                 if (query.exec()) {
                     int stream_index = 0;
                     while (query.next()) { // if this loops then its a new stream/track/dupe
+
+                        if (not active) return;
+
                         //QString table_str = table;
                         QSqlRecord record = query.record();
 
@@ -204,31 +301,33 @@ void MetaDatabaseWorker::SendMetadataToMediaItem()
 
                         // TODO: get video/audio default stream, if possible. Or use "user meta" option so the chosen default is shown first / in labels / etc.
 
-                        // TODO: Only send the correct General metadata and not the duplicates?
-                        // Or send all and only show the "setDefaultStream", then something can be done like "show duplicate files", etc.
+                        // Only send the correct General metadata and not the duplicates
+                        // TODO: Or send all and only show the "setDefaultStream", then something can be done like "show duplicate files", etc.
                         if (table == Table::General) {
                             //qDebug() << record.value(Field::General::FilePath).toString() << "=/=" << file_path_str;
                             if (record.value(Field::General::FilePath).toString() == file_path_str)
                                 stream_index = 0; // media_item->setDefaultStream(table, stream_index);
                             else {
                                 // Only first duplicate will get thumbnail data, so use the same data for each duplicate and skip other metadata. TODO: ThumbnailPath?
-                                QVariant thumbnail_data = record.value(Field::General::ThumbnailData);
+                                /*QVariant thumbnail_data = record.value(Field::Extended::ThumbnailData);
                                 if (thumbnail_data.isValid()) {
                                     media_item->updateThumbnail(thumbnail_data.toByteArray());
-                                }
+                                }*/
                                 continue;
                             }
                         }
                         for (QString field : DatabaseSchema::getAllFieldsFor(table)) {
 
+                            if (not active) return;
+
                             QVariant value = record.value(field);
                             if (value.isValid() and not value.isNull() and value.toString().length()) { // ignores "" but allows 0
 
                                 // Intercept thumbnail data/path
-                                if (field == Field::General::ThumbnailData) {
+                                if (field == Field::Extended::ThumbnailData) {
                                     media_item->updateThumbnail(value.toByteArray());
                                 }
-                                else if (field == Field::General::ThumbnailPath) {
+                                else if (field == Field::Extended::ThumbnailPath) {
                                     media_item->updateThumbnail(value.toString()); // Only if not already set via ThumbnailData
                                 }
                                 else {
@@ -240,7 +339,7 @@ void MetaDatabaseWorker::SendMetadataToMediaItem()
                         stream_index++;
                         /*/
                         for (int i = 0; i < record.count(); i++) {
-                            if (record.fieldName(i) == Field::General::ThumbnailData) continue;
+                            if (record.fieldName(i) == Field::Extended::ThumbnailData) continue;
                             qDebug().nospace() << ">>" << table << " (" << record.count() << ") :: " << record.fieldName(i) << " : " << record.value(i);
                         }//*/
                     }
@@ -254,6 +353,7 @@ void MetaDatabaseWorker::SendMetadataToMediaItem()
             mutex.unlock();
         }
     }
+    emit progressMade(1);
     emit mediaItemUpdated(media_item);
 }
 
@@ -323,67 +423,115 @@ bool MetaDatabaseWorker::OpenDatabase()
     return database.open();
 }
 
-bool MetaDatabaseWorker::ExistsInDatabase(QString table)
+bool MetaDatabaseWorker::ExistsInDatabase(QString table) // Note: This also sets (General) frame_count, file_format, (Extended) media_filter, media_type, 
 {
     bool exists = false;
+    //
     QString select = QString("SELECT * FROM \"%1\" WHERE \"%2\" = \"%3\"")
         .arg(table)
         .arg(Field::General::Id)
-        .arg(file_id);
+        .arg(file_id);//*/
 
-    //qDebug() << "ExistsInDatabase():" << select;
+    /*/ Are "joins" not possible?
+    QString select = QString("SELECT * FROM \"%1\" WHERE \"%3\" = \"%4\" UNION SELECT * FROM \"%2\" WHERE \"%3\" = \"%4\"")
+    //QString select = QString("SELECT * FROM \"%1\" INNER JOIN \"%2\" ON \"%3\" = \"%3\" WHERE \"%3\" = \"%4\"")
+    //QString select = QString("SELECT * FROM \"%1\" INNER JOIN \"%2\" ON \"%1.%3\" = \"%2.%3\" WHERE \"%3\" = \"%4\"")
+        .arg(table)
+        .arg(Table::Extended)
+        .arg(Field::General::Id)
+        .arg(file_id);//*/
+    /*SELECT ProductID, ProductName, CategoryName
+        FROM Products
+        INNER JOIN Categories ON Products.CategoryID = Categories.CategoryID;
+        
+        SELECT * FROM \"General\" INNER JOIN \"Extended\" ON \"General.Id\" = \"Extended.Id\" WHERE \"Id\" = \"7283961575709687\"
+        SELECT * FROM \"General\" INNER JOIN \"Extended\" ON   General.Id   =   Extended.Id   WHERE \"Id\" = \"7283961575709687\"
+        SELECT * FROM \"General\" INNER JOIN \"Extended\" ON \"Id\"         = \"Id\"          WHERE \"Id\" = \"1105801712033444\"
+
+
+        SELECT City, Country FROM Customers
+        WHERE Country='Germany'
+        UNION
+        SELECT City, Country FROM Suppliers
+        WHERE Country='Germany'
+        ORDER BY City;
+
+        SELECT * FROM \"General\" WHERE \"Id\" = \"1105801712033444\" UNION SELECT * FROM \"Extended\" WHERE \"Id\" = \"1105801712033444\"
+
+        */
+
     QSqlQuery query(select, database);
 
     if (query.exec()) {
         if (table == Table::General) {
+
             while (query.next()) {
                 exists = true;
-                if (query.record().value(Field::General::FilePath).toString() == file_path_str) {
-                    media_filters = MA::Media::Type(query.record().value(Field::General::MediaStreams).toInt());
-                    media_type = MA::Media::Type(query.record().value(Field::General::MediaType).toInt());
-                    if (query.record().contains(Field::Graphic::FrameCount) and query.record().value(Field::Graphic::FrameCount).isValid())
+
+                if (frame_count == 0
+                    and query.record().contains(Field::Graphic::FrameCount)
+                    and query.record().value(Field::Graphic::FrameCount).isValid()) // Note: these are from General, not Graphic. TODO: Get from Graphic Table? Does it matter?
                         frame_count = query.record().value(Field::Graphic::FrameCount).toInt();
-                    if (query.record().contains(Field::General::Format) and query.record().value(Field::General::Format).isValid())
+                if (file_format.isEmpty()
+                    and query.record().contains(Field::General::Format)
+                    and query.record().value(Field::General::Format).isValid())
                         file_format = query.record().value(Field::Graphic::Format).toString();
-                    duplicate_file_found = false;
+
+                if (query.record().value(Field::General::FilePath).toString() == file_path_str) {
+                    new_duplicate_file_found = false;
                     break;
                 }
-                if (query.record().value(Field::General::FilePath).toString() != file_path_str) {
+                else {
+                //if (query.record().value(Field::General::FilePath).toString() != file_path_str) {
                     // TODO: Update other tables, or skip? user setting?
-                    duplicate_file_found = true;
-                    media_filters = MA::Media::Type(query.record().value(Field::General::MediaStreams).toInt());
-                    media_type = MA::Media::Type(query.record().value(Field::General::MediaType).toInt());
-                    if (query.record().contains(Field::Graphic::FrameCount) and query.record().value(Field::Graphic::FrameCount).isValid())
-                        frame_count = query.record().value(Field::Graphic::FrameCount).toInt();
-                    if (query.record().contains(Field::General::Format) and query.record().value(Field::General::Format).isValid())
-                        file_format = query.record().value(Field::Graphic::Format).toString();
+                    new_duplicate_file_found = true;
                 }
             }
         }
-        else {
+        else if (table == Table::Extended) {
+            if (query.next()) {
+                exists = true;
+                media_filter = MA::Media::Type(query.record().value(Field::Extended::MediaStreams).toInt());
+                media_type = MA::Media::Type(query.record().value(Field::Extended::MediaType).toInt());
+            }
+        }
+        else { // Note: This is used to check if other tables (param) with this file's ID exist.
             while (query.next()) {
                 exists = true;
             }
         }
-
-        //else {
-            // TODO: Update if...?
-            // TODO: check if file path exist, if so check if other metadata metadata matches (options unlikely to have changed: duration, file size, dimensions)
-            // TODO: update id to new id and any other metadata that changed
-        //}
     }
     else {
         qWarning() << "ERROR: Failed Exists In Database Query:" << query.lastError();
         qWarning() << "ERROR: The Failed Query:" << query.lastQuery();
     }
 
-    // If update_metadata already true, don't change.
-    //update_metadata = (update_metadata) ? update_metadata : duplicate_file_found;
-    if ((MA::Update::Metadata & update_filter) == 0 and duplicate_file_found)
+    // Will make a new (only) general record for any duplicate file via an update. (If update_metadata already set, don't change it)
+    if ((MA::Update::Metadata & update_filter) == 0 and new_duplicate_file_found)
         update_filter |= MA::Update::Metadata;
 
     query.finish();
     return exists;
+}
+
+bool MetaDatabaseWorker::DeleteFromDatabase(QString table) // Currently unused
+{
+    bool deleted = false;
+    QString delete_record = QString("DELETE FROM \"%1\" WHERE \"%2\" = \"%3\"")
+        .arg(table)
+        .arg(Field::General::Id)
+        .arg(file_id);
+    QSqlQuery query(delete_record, database);
+
+    if (query.exec()) {
+        qDebug().noquote().nospace() << "Records Deleted From " << table << ": " << query.numRowsAffected();
+        deleted = query.numRowsAffected();
+    }
+    else {
+        qWarning() << "ERROR: Failed To Delete Record From Database:" << query.lastError();
+        qWarning() << "ERROR: The Failed Query:" << query.lastQuery();
+    }
+    return deleted;
 }
 
 MA::Media::Type MetaDatabaseWorker::BuildMetadataMaps()
@@ -393,6 +541,7 @@ MA::Media::Type MetaDatabaseWorker::BuildMetadataMaps()
     size_t media_file = media_info_file.Open(file_path);
     //qDebug() << "Summarized Raw Data -> " << media_info_file.Inform();
     if (not media_info_file.IsReady()) {
+        emit progressMade(8);
         return MA::Media::Type::Unknown;
     }
     for (int stream_type = 0; stream_type < MediaInfoDLL::stream_t::Stream_Max; stream_type++) {
@@ -400,9 +549,10 @@ MA::Media::Type MetaDatabaseWorker::BuildMetadataMaps()
         int stream_count = QVariant(QString::fromStdWString(media_info_file.Get(stream_kind, 0, 2, MediaInfoDLL::Info_Text).c_str())).toInt();
         //qDebug() << "Stream Kind:" << MEDIA_INFO::print(stream_kind) << "| Streams/Tracks:" << stream_count;
         
-        if (duplicate_file_found and stream_kind != MediaInfoDLL::stream_t::Stream_General)
+        if (new_duplicate_file_found and stream_kind != MediaInfoDLL::stream_t::Stream_General) {
+            emit progressMade(1);
             continue;
-
+        }
         for (int stream = 0; stream < stream_count; stream++) {
             int param_count = QVariant(QString::fromStdWString(media_info_file.Get(stream_kind, stream, 0, MediaInfoDLL::Info_Text).c_str())).toInt();
             int param_alt_index = 0;
@@ -443,6 +593,7 @@ MA::Media::Type MetaDatabaseWorker::BuildMetadataMaps()
                 }
             }
         }
+        emit progressMade(1);
     }
 
 
@@ -454,28 +605,20 @@ MA::Media::Type MetaDatabaseWorker::BuildMetadataMaps()
 
 
 
-
-    // Move music metadata from general_metadata to music_metadata.
-    /*for (auto& field : Field::Music::getAllFields()) {
-        if (general_metadata->contains(field)) {
-            music_metadata->insert(general_metadata->extract(field));
-        }
-    }*/
-
     // Get media type and filter based on metadata gathered. 
-    //if (media_filters == MA::Media::Type::Unknown) { // Skips on duplicate_file_found
-    if (not duplicate_file_found) {
+    //if (media_filter == MA::Media::Type::Unknown) { // Skips on new_duplicate_file_found
+    if (not new_duplicate_file_found) {
         if (general_metadata_maps.size())
-            media_filters = MA::Media::Type::Other;
+            media_filter = MA::Media::Type::Other;
         if (video_metadata_maps.size())
-            media_filters |= MA::Media::Type::Video;
+            media_filter |= MA::Media::Type::Video;
         if (audio_metadata_maps.size())
-            media_filters |= MA::Media::Type::Audio;
+            media_filter |= MA::Media::Type::Audio;
         if (music_metadata_maps.size())
-            media_filters |= MA::Media::Type::Music;
+            media_filter |= MA::Media::Type::Music;
         if (image_metadata_maps.size())
-            media_filters |= MA::Media::Type::Image;
-        media_type = MA::Media::getTypeFromFilter(media_filters);
+            media_filter |= MA::Media::Type::Image;
+        media_type = MA::Media::getTypeFromFilter(media_filter);
     }
 
 
@@ -486,7 +629,7 @@ MA::Media::Type MetaDatabaseWorker::BuildMetadataMaps()
     //int file_permissions = int(std::filesystem::status(file_path).permissions());
     //bool file_read_only = !int(std::filesystem::perms::owner_write) & file_permissions;
 
-    // Get Other File Attributes
+    // Get Other File Attributes // TODO: use DirectoryTreeViewer pathChecker static function?
     // https://learn.microsoft.com/en-us/windows/win32/fileio/file-attribute-constants
     DWORD attributes = GetFileAttributes(file_path.wstring().c_str()); // Windows Only
     bool file_read_only = attributes & FILE_ATTRIBUTE_READONLY;
@@ -524,19 +667,20 @@ MA::Media::Type MetaDatabaseWorker::BuildMetadataMaps()
     // Add key value pairs to metadata maps not included in media info. Thumbnail data/path added in CreateThumbnailImages()
     AddAdditionalDatabaseFields(general_metadata_maps, Field::General::Id, file_id);
     //AddAdditionalDatabaseFields(general_metadata_maps.at(0).get(), Field::General::Id, file_id);
-    AddAdditionalDatabaseFields(general_metadata_maps, Field::General::MediaType, media_type);
-    AddAdditionalDatabaseFields(general_metadata_maps, Field::General::MediaStreams, media_filters);
     AddAdditionalDatabaseFields(general_metadata_maps, Field::General::FileSize, file_size, false);
     AddAdditionalDatabaseFields(general_metadata_maps, Field::General::FileCreated, file_date_created, false);
     AddAdditionalDatabaseFields(general_metadata_maps, Field::General::FileLastMod, file_date_modified, false);
     AddAdditionalDatabaseFields(general_metadata_maps, Field::General::FileAttributes, static_cast<long long>(attributes));
     AddAdditionalDatabaseFields(general_metadata_maps, Field::General::FileTargetPath, target_path_str);
-    if (not duplicate_file_found) {
+    if (not new_duplicate_file_found) {
         AddAdditionalDatabaseFields(video_metadata_maps, Field::Graphic::Id, file_id);
         AddAdditionalDatabaseFields(audio_metadata_maps, Field::Audio::Id, file_id);
         AddAdditionalDatabaseFields(music_metadata_maps, Field::Music::Id, file_id);
         AddAdditionalDatabaseFields(image_metadata_maps, Field::Music::Id, file_id);
+        AddAdditionalDatabaseFields(extended_metadata_maps, Field::Extended::Id, file_id);
     }
+    AddAdditionalDatabaseFields(extended_metadata_maps, Field::Extended::MediaType, media_type);
+    AddAdditionalDatabaseFields(extended_metadata_maps, Field::Extended::MediaStreams, media_filter);
 
     /*/ Print Out... GENERAL
     for (const auto& m : general_metadata_maps) {
@@ -568,7 +712,7 @@ MA::Media::Type MetaDatabaseWorker::BuildMetadataMaps()
             qDebug() << "I{" << p.first << " => " << p.second << "}";
         }
     }//*/
-
+    emit progressMade(1);
     return media_type;
 }
 
@@ -1021,7 +1165,7 @@ MetaDatabaseWorker::KeyValuePair MetaDatabaseWorker::GetProperKeyAndValue(std::w
 bool MetaDatabaseWorker::PlaceKeyValuePairIntoCorrectMap(KeyValuePair key_value_pair, MediaInfoDLL::stream_t stream_kind, int stream)
 {
     bool success = true;
-    if (MediaInfoDLL::Stream_General == stream_kind) {
+    if (MediaInfoDLL::stream_t::Stream_General == stream_kind) {
         if (Field::Music::doesFieldExist(key_value_pair.key)) {
             // Moving: General -> Music
             if (stream >= music_metadata_maps.size()) {
@@ -1041,26 +1185,33 @@ bool MetaDatabaseWorker::PlaceKeyValuePairIntoCorrectMap(KeyValuePair key_value_
             general_metadata_maps.at(stream)->emplace(key_value_pair.key, key_value_pair.value);
         }
     }
-    else if (MediaInfoDLL::Stream_Video == stream_kind) {
+    else if (MediaInfoDLL::stream_t::Stream_Video == stream_kind) {
         if (stream >= video_metadata_maps.size()) {
             video_metadata_maps.push_back(std::make_unique<std::map<QString, QVariant>>());
             return PlaceKeyValuePairIntoCorrectMap(key_value_pair, stream_kind, stream);
         }
         video_metadata_maps.at(stream)->emplace(key_value_pair.key, key_value_pair.value);
     }
-    else if (MediaInfoDLL::Stream_Audio == stream_kind) {
+    else if (MediaInfoDLL::stream_t::Stream_Audio == stream_kind) {
         if (stream >= audio_metadata_maps.size()) {
             audio_metadata_maps.push_back(std::make_unique<std::map<QString, QVariant>>());
             return PlaceKeyValuePairIntoCorrectMap(key_value_pair, stream_kind, stream);
         }
         audio_metadata_maps.at(stream)->emplace(key_value_pair.key, key_value_pair.value);
     }
-    else if (MediaInfoDLL::Stream_Image == stream_kind) {
+    else if (MediaInfoDLL::stream_t::Stream_Image == stream_kind) {
         if (stream >= image_metadata_maps.size()) {
             image_metadata_maps.push_back(std::make_unique<std::map<QString, QVariant>>());
             return PlaceKeyValuePairIntoCorrectMap(key_value_pair, stream_kind, stream);
         }
         image_metadata_maps.at(stream)->emplace(key_value_pair.key, key_value_pair.value);
+    }
+    else if (MediaInfoDLL::stream_t::Stream_Other == stream_kind) { // Note: Stream_Other == Extended
+        if (stream >= extended_metadata_maps.size()) {
+            extended_metadata_maps.push_back(std::make_unique<std::map<QString, QVariant>>());
+            return PlaceKeyValuePairIntoCorrectMap(key_value_pair, stream_kind, stream);
+        }
+        extended_metadata_maps.at(stream)->emplace(key_value_pair.key, key_value_pair.value);
     }
     //else if (MediaInfoDLL::Stream_Text == stream_kind) {}
     else {
@@ -1162,28 +1313,34 @@ void MetaDatabaseWorker::CreateThumbnailImages()
     // TODO: Based on above use this to search for more images based on each file (in current directory) without a thumbnail.
     //       Search that "direct path", parent, and sub-dirs of parent if it matches the same name as the parent of "direct path"
     
+    if (not active) return;
 
-    // Note: Don't create and save more of the same thumbnail if dupe, but still get any different thumbnail paths. (TODO: use correct path and fall back to original dupe thumbnail path if not found)
-    if ((MA::Media::Type::Video | MA::Media::Type::Image | MA::Media::Type::Music) & media_filters and not duplicate_file_found) {
+    bool async_processing = user_settings->getUserSetting(Field::Settings::AsynchronousFileProcessing).toBool();
+    if (async_processing and not new_duplicate_file_found and isLargeFile()) {
+        setPaused(true);
+        emit heavyComputationStarted(); // Un-pause first (to get here)
+        WaitingLoop();
+        heavy_computation_in_progress = true;
+    }
+
+    QTime start_time = QTime::currentTime();
+    QTime end_time(0, 0, 0, 0);
+    int progressed = 0;
+
+    // TODO: Don't create and save more of the same thumbnail if dupe, but still get any different thumbnail paths. (TODO: use correct path and fall back to original dupe thumbnail path if not found)
+    if ((MA::Media::Type::Video | MA::Media::Type::Image | MA::Media::Type::Music) & media_filter and not new_duplicate_file_found) {
     
-        //int duration;
-        int thumbnail_count;
         int frame_interval;
         int skip_frames_above;
-        long max_frames = user_settings.getUserSetting(Field::Settings::MaxFramesToSearch).toLongLong();
+        long max_frames = user_settings->getUserSetting(Field::Settings::MaxFramesToSearch).toLongLong();
 
-        if (media_filters & MA::Media::Type::Video) {
-            // TODO: Backup/Alt: do some math and get maximum frames in video, use it to set frame_interval.
-            //       If frames not in metadata, get duration and frame rate. else guess based on file size.  duration / 30 FPS?
-            //       Even if FPS is wrong it should get close to the right number of thumbnails spread across the video.
-            //duration = general_metadata_maps.at(0)->at(Field::General::Duration).toInt();
+        if (media_filter & MA::Media::Type::Video) {
             if (general_metadata_maps.at(0)->contains(Field::Graphic::FrameCount) and general_metadata_maps.at(0)->at(Field::Graphic::FrameCount).isValid()) {
                 frame_count = general_metadata_maps.at(0)->at(Field::Graphic::FrameCount).toInt();
             }
             else if (frame_count == 0) {
-                qWarning() << "WARNING: Missing frame_count, need alt why to create 'frame_interval'";
+                qWarning() << "WARNING: Missing frame_count, need alt way to create 'frame_interval'";
             }
-            thumbnail_count = user_settings.getUserSetting(Field::Settings::VideoThumbnailCount).toInt();
             if (frame_count > max_frames)
                 frame_count = max_frames;
             frame_interval = frame_count / (thumbnail_count + 1);
@@ -1200,7 +1357,6 @@ void MetaDatabaseWorker::CreateThumbnailImages()
         AVPacket* packet;
         AVFrame* frame;
         AVFrame* rgb_frame;
-        //std::vector<QPixmap> thumbnail_images;
         //QVector<QImage> thumbnail_images;
         QVector<QPixmap> thumbnail_images;
 
@@ -1213,6 +1369,9 @@ void MetaDatabaseWorker::CreateThumbnailImages()
             // 
             if ((return_value = LoadInAVContexts(file_path.string().c_str())) > -1) {
                 while (av_read_frame(format_context, packet) >= 0) {
+
+                    if (not active) break;
+
                     if (packet->stream_index == video_stream_index) {
 
                         // Skip last thumbnail, else it will be a frame near the very end of video.
@@ -1224,6 +1383,12 @@ void MetaDatabaseWorker::CreateThumbnailImages()
                                 thumbnail_images.push_back(*thumbnail_pixmap);
                                 //av_frame_free(&rgb_frame);
                                 delete thumbnail_pixmap;
+                                progressed++;
+                                emit progressMade(1);
+
+                                // No need to traverse any more frames if the next viable frame is already known to be above the limit.
+                                if (decoder_context->frame_num + frame_interval > skip_frames_above)
+                                    break; // Not a big speedup because "skip_frames_above" is right at, or only a few frames above, the last frame saved.
                             }
                             // Is this unnecessary?
                             av_frame_free(&rgb_frame);
@@ -1256,6 +1421,10 @@ void MetaDatabaseWorker::CreateThumbnailImages()
         delete packet;
         delete decoder_context;
         delete format_context;
+        decoder_context = nullptr;
+        format_context = nullptr;
+
+        if (not active) return;
 
         if (return_value < 0 and return_value != AVERROR_EOF) {
             qWarning() << "ERROR: AV Loading Error:" << return_value;
@@ -1269,12 +1438,14 @@ void MetaDatabaseWorker::CreateThumbnailImages()
             // Saved JPEG images should be about 6 kb each, but when saving 8 images (pixmap) to the DB it's adding an extra ~340kb
             thumbnail_images.clear();
 
-            AddAdditionalDatabaseFields(general_metadata_maps, Field::General::ThumbnailData, ":thumbnail");
+            AddAdditionalDatabaseFields(extended_metadata_maps, Field::Extended::ThumbnailData, ":thumbnail");
         }
         else {
             thumbnail_data = 0;
         }
     }
+    
+    if (not active) return;
 
     if (media_type & MA::Media::Type::Image) {
         thumbnail_path = QString::fromStdString(file_path.string());
@@ -1286,8 +1457,12 @@ void MetaDatabaseWorker::CreateThumbnailImages()
         for (auto const& dir_entry : std::filesystem::recursive_directory_iterator{ file_path.parent_path(), std::filesystem::directory_options::skip_permission_denied }) {
             std::string stem = dir_entry.path().stem().string();
             std::string ext = dir_entry.path().extension().string();
-            if (stem == "cover" or stem == "folder" or stem == "front" or stem == "front-cover" or stem == "embedded" or stem == file_path.stem().string()) {
-                if (ext == ".jpg" or ext == ".jpeg" or ext == ".png" or ext == ".bpm") {
+            std::string file_stem = file_path.stem().string();
+            std::transform(stem.begin(), stem.end(), stem.begin(), tolower);
+            std::transform(ext.begin(), ext.end(), ext.begin(), tolower);
+            std::transform(file_stem.begin(), file_stem.end(), file_stem.begin(), tolower);
+            if (ext == ".jpg" or ext == ".jpeg" or ext == ".png" or ext == ".bpm") {
+                if (stem == "cover" or stem == "folder" or stem == "front" or stem == "front-cover" or stem == "embedded" or stem == file_stem) {
                     thumbnail_link = dir_entry.path();
                     thumbnail_link.make_preferred();
                     break;
@@ -1298,8 +1473,10 @@ void MetaDatabaseWorker::CreateThumbnailImages()
             for (auto const& dir_entry : std::filesystem::directory_iterator{ file_path.parent_path().parent_path(), std::filesystem::directory_options::skip_permission_denied }) {
                 std::string stem = dir_entry.path().stem().string();
                 std::string ext = dir_entry.path().extension().string();
-                if (stem == "cover" or stem == "folder" or stem == "front" or stem == "front-cover") {
-                    if (ext == ".jpg" or ext == ".jpeg" or ext == ".png" or ext == ".bpm") {
+                std::transform(stem.begin(), stem.end(), stem.begin(), tolower);
+                std::transform(ext.begin(), ext.end(), ext.begin(), tolower);
+                if (ext == ".jpg" or ext == ".jpeg" or ext == ".png" or ext == ".bpm") {
+                    if (stem == "cover" or stem == "folder" or stem == "front" or stem == "front-cover") {
                         thumbnail_link = dir_entry.path();
                         thumbnail_link.make_preferred();
                         break;
@@ -1310,11 +1487,25 @@ void MetaDatabaseWorker::CreateThumbnailImages()
         if (std::filesystem::exists(thumbnail_link)) {
             //qDebug() << "Found Music Thumbnail:" << thumbnail_link.string();
             thumbnail_path = QString::fromStdString(thumbnail_link.string());
-            AddAdditionalDatabaseFields(general_metadata_maps, Field::General::ThumbnailPath, thumbnail_path);
+            AddAdditionalDatabaseFields(extended_metadata_maps, Field::Extended::ThumbnailPath, thumbnail_path);
         }
     }
+    
+    if (not active) return;
+
     AddAdditionalDatabaseFields(general_metadata_maps, Field::General::Id, file_id, false);
     AddAdditionalDatabaseFields(general_metadata_maps, Field::General::FilePath, file_path_str, false);
+    AddAdditionalDatabaseFields(extended_metadata_maps, Field::Extended::Id, file_id, false);
+
+    if (not thumbnail_data.isNull())
+        qDebug() << "Thumbnails created for" << file_name << "in" << end_time.addMSecs(start_time.msecsTo(QTime::currentTime())).toString("m:ss.zzz") << "milliseconds";
+
+    emit progressMade(thumbnail_count - progressed);
+
+    if (async_processing and not new_duplicate_file_found and isLargeFile()) {
+        heavy_computation_in_progress = false;
+        emit heavyComputationEnded(); // Un-pause next
+    }
 }
 
 int MetaDatabaseWorker::LoadInAVContexts(const char* file_path_char, int force_jpeg_codec_for_embedded_stream, bool embedded_file_saved)
@@ -1461,7 +1652,7 @@ AVFrame* MetaDatabaseWorker::DecodeFrame(AVCodecContext* codec_context, AVFrame*
         return nullptr;
     }
 
-    int media_item_size = user_settings.getUserSetting(Field::Settings::MediaItemStorageSize).toInt();;
+    int media_item_size = user_settings->getUserSetting(Field::Settings::MediaItemStorageSize).toInt();;
 
     // Scale image keeping aspect ratio
     int scaled_width = codec_context->width;
@@ -1542,7 +1733,7 @@ AVFrame* MetaDatabaseWorker::DecodeFrame(AVCodecContext* codec_context, AVFrame*
     // Scale frame, if available, with no errors.
     if (return_value >= 0) {
 
-        qDebug().nospace() << "Decoding frame #" << codec_context->frame_num;
+        qDebug().nospace().noquote() << "Decoding frame #" << codec_context->frame_num << " (" << file_name << ")";
 
         // Scale/Convert the old frame to the new RGB frame.
         sws_scale(scale_context, frame->data, frame->linesize, 0, frame->height, rgb_frame->data, rgb_frame->linesize);
@@ -1582,7 +1773,7 @@ AVFrame* MetaDatabaseWorker::DecodeFrame(AVCodecContext* codec_context, AVFrame*
 
 QPixmap* MetaDatabaseWorker::FrameToPixmap(const AVFrame* frame) const
 {
-    QImage image(frame->width, frame->height, QImage::Format::Format_RGB888); // Format_RGB888 - AV_PIX_FMT_YUVJ444P to AV_PIX_FMT_RGB24
+    QImage image(frame->width, frame->height, QImage::Format::Format_RGB888);
     size_t pix_multi = 3; // 3-24, 4-32, 5-64
     for (size_t y = 0; y < frame->height; y++) {
         memcpy(image.scanLine(y), frame->data[0] + y * frame->linesize[0], pix_multi * frame->width);
@@ -1694,7 +1885,7 @@ bool MetaDatabaseWorker::AddToDatabase()
     for (auto& map : general_metadata_maps) {
         metadata_query_strings.append(BuildDatabaseInsertQueryString(map.get(), Table::General));
     }
-    if (not duplicate_file_found) {
+    if (not new_duplicate_file_found) {
         for (auto& map : video_metadata_maps) {
             metadata_query_strings.append(BuildDatabaseInsertQueryString(map.get(), Table::Graphic));
         }
@@ -1706,6 +1897,9 @@ bool MetaDatabaseWorker::AddToDatabase()
         }
         for (auto& map : image_metadata_maps) {
             metadata_query_strings.append(BuildDatabaseInsertQueryString(map.get(), Table::Graphic));
+        }
+        for (auto& map : extended_metadata_maps) {
+            metadata_query_strings.append(BuildDatabaseInsertQueryString(map.get(), Table::Extended));
         }
     }
     return ExecuteQueryStrings(metadata_query_strings);
@@ -1721,7 +1915,7 @@ bool MetaDatabaseWorker::UpdateDatabase()
         for (int i = 0; i < general_metadata_maps.size(); i++) {
             auto& map = general_metadata_maps.at(i);
             for (auto& field : Field::General::getAllFields()) {
-                if (not map->contains(field) and (field != Field::General::ThumbnailData and field != Field::General::ThumbnailPath)) {
+                if (not map->contains(field)) { // and (field != Field::General::ThumbnailData and field != Field::General::ThumbnailPath)) {
                     KeyValuePair key_value_pair(field, QVariant()); // Reset to NULL (except thumbnails)
                     //AddAdditionalDatabaseFields(general_metadata_maps.at(i).get(), field, media_type);
                     if (not PlaceKeyValuePairIntoCorrectMap(key_value_pair, MediaInfoDLL::stream_t::Stream_General, i))
@@ -1730,7 +1924,6 @@ bool MetaDatabaseWorker::UpdateDatabase()
             }
             metadata_query_strings.append(BuildDatabaseUpdateQueryString(map.get(), Table::General));
         }
-
         for (int i = 0; i < video_metadata_maps.size(); i++) {
             auto& map = video_metadata_maps.at(i);
             for (auto& field : Field::Graphic::getAllFields()) {
@@ -1775,12 +1968,22 @@ bool MetaDatabaseWorker::UpdateDatabase()
             }
             metadata_query_strings.append(BuildDatabaseUpdateQueryString(map.get(), Table::Graphic));
         }
+        for (int i = 0; i < extended_metadata_maps.size(); i++) {
+            auto& map = extended_metadata_maps.at(i);
+            for (auto& field : Field::Extended::getAllFields()) {
+                if (not map->contains(field) and (field != Field::Extended::ThumbnailData and field != Field::Extended::ThumbnailPath)) {
+                    KeyValuePair key_value_pair(field, QVariant()); // Reset to NULL
+                    if (not PlaceKeyValuePairIntoCorrectMap(key_value_pair, MediaInfoDLL::stream_t::Stream_Other, i)) // Note: Stream_Other == Extended
+                        qWarning() << "WANRING: Field not added to map:" << field;
+                }
+            }
+            metadata_query_strings.append(BuildDatabaseUpdateQueryString(map.get(), Table::Extended));
+        }
     }
     else if ((MA::Update::SmallFileThumbnails | MA::Update::AllFileThumbnails) & update_filter) {
-        if (general_metadata_maps.at(0)->contains(Field::General::ThumbnailData) or general_metadata_maps.at(0)->contains(Field::General::ThumbnailPath))
-            metadata_query_strings.append(BuildDatabaseUpdateQueryString(general_metadata_maps.at(0).get(), Table::General));
+        if (extended_metadata_maps.at(0)->contains(Field::Extended::ThumbnailData) or extended_metadata_maps.at(0)->contains(Field::Extended::ThumbnailPath))
+            metadata_query_strings.append(BuildDatabaseUpdateQueryString(extended_metadata_maps.at(0).get(), Table::Extended));
     }
-
     if (user_meta) {
         if (ExistsInDatabase(Table::UserMeta))
             metadata_query_strings.append(BuildDatabaseUpdateQueryString(user_meta, Table::UserMeta));
@@ -1789,23 +1992,24 @@ bool MetaDatabaseWorker::UpdateDatabase()
             metadata_query_strings.append(BuildDatabaseInsertQueryString(user_meta, Table::UserMeta));
         }
     }
-
     return ExecuteQueryStrings(metadata_query_strings);
 }
 
 bool MetaDatabaseWorker::ExecuteQueryStrings(QList<QString> query_strings)
 {
     bool success = true;
-    bool general = true;
+    //bool general = true;
     QSqlQuery query(database);
+    
     for (auto& qs : query_strings) {
         //qDebug() << qs;
         if (qs.length()) {
             query.prepare(qs);
-            if (general) {
+            query.bindValue(":thumbnail", thumbnail_data);
+            /*if (general) {
                 query.bindValue(":thumbnail", thumbnail_data);
                 general = false;
-            }
+            }*/
             if (query.exec()) {
                 qDebug().nospace() << "Values added/updated successfully to DB. | File: " << file_path.filename().string() << " | Query: " << query.lastQuery();
                 //success = true;
@@ -1814,11 +2018,18 @@ bool MetaDatabaseWorker::ExecuteQueryStrings(QList<QString> query_strings)
                 qWarning() << "ERROR: Failed To add Values from file:" << file_path.filename().string() << " | " << query.lastError();
                 qWarning() << "ERROR: The Failed Query:" << query.lastQuery();
                 success = false;
+                // TODO: Inform user of error and how to possibly fix it.
             }
             query.clear();
             query.finish();
         }
     }
+    if (success) {
+        emit databaseUpdated(file_id);
+        emit progressMade(1);
+    }
+    else
+        emit progressMade(2); // Next step will be skipped on fail
     return success;
 }
 
