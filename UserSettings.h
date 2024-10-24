@@ -22,13 +22,12 @@ public:
 
     void loadUserSettings();
     bool saveUserSettings();
-    //bool saveUserSettings(QString field);
-    //bool saveUserSettings(QStringList fields);
     bool areSettingsUnsaved() const;
     bool hasSettingChanged(QString field) const;
     QVariant getUnsavedUserSetting(QString field) const;
     QVariant getUserSetting(QString field) const;
     bool setUserSetting(QString field, QVariant value, bool save_user_settings = false);
+    void clearUnsavedUserSettings();
     void printSettings() const;
 
 private:
