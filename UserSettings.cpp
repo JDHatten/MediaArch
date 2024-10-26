@@ -13,7 +13,6 @@ UserSettings::~UserSettings() {
 
 void UserSettings::loadUserSettings()
 {
-    //DeleteUserSettings();
     if (database.open()) {
        QString select = QString("SELECT * FROM \"%1\" WHERE \"%2\" = %3")
             .arg(Table::Settings)
@@ -41,14 +40,23 @@ void UserSettings::loadUserSettings()
     }
     database.close();
 
-    // Convert "DirectoryListHistory" String to StringList
-    if (user_record.contains(Field::Settings::DirectoryListHistory)) {
-        QString directory_history_str = user_record.value(Field::Settings::DirectoryListHistory).toString();
-        QStringList directory_list_history;
-        if (directory_history_str.length()) {
-            directory_list_history = directory_history_str.split("|");
+    // Convert String Blobs to String Lists
+    QStringList string_blob_fields = {
+        Field::Settings::DirectoryListHistory,
+        Field::Settings::ColumnLabelsTable,
+        Field::Settings::ColumnLabelsField,
+        Field::Settings::ListOfPlaylists,
+        Field::Settings::ListOfPlaylistFolders
+    };
+    for (auto& field : string_blob_fields) {
+        if (user_record.contains(field)) {
+            QString string_blob = user_record.value(field).toString();
+            QStringList string_list;
+            if (string_blob.length()) {
+                string_list = string_blob.split("|");
+            }
+            user_record.setValue(field, string_list);
         }
-        user_record.setValue(Field::Settings::DirectoryListHistory, directory_list_history);
     }
 }
 
@@ -195,10 +203,20 @@ bool UserSettings::setUserSetting(QString field, QVariant value, bool save_user_
             if (save_user_settings)
                 return saveUserSettings();
         }
+        else {
+            if (unsaved_settings.contains(field))
+                unsaved_settings.remove(field); // value was changed previously, so change it back.
+            return false;
+        }
         return true;
     }
     qWarning() << "ERROR:" << field << "setting does not exist.";
     return false;
+}
+
+void UserSettings::clearUnsavedUserSettings()
+{
+    unsaved_settings.clear();
 }
 
 void UserSettings::printSettings() const
