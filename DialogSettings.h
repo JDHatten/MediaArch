@@ -40,13 +40,15 @@ private:
     QWidget* thumbnail_view_tab = nullptr;
     QLineEdit* date_time_format_edit = nullptr;
     QSpinBox* directory_history_limit_spinner = nullptr;
+    QSpinBox* sub_directory_look_ahead_limit_spinner = nullptr;
     QSpinBox* media_divider_handle_width_spinner = nullptr;
     QComboBox* sub_dir_sort_method_combo = nullptr;
+    SwitchButton* async_file_processing_switch = nullptr;
     QComboBox* modifier_key_select_combo = nullptr;
     QComboBox* modifier_key_multi_select_combo = nullptr;
     QComboBox* modifier_key_unselect_combo = nullptr;
     SwitchButton* selection_looping_switch = nullptr;
-
+    
     QSpinBox* media_item_size_spinner = nullptr;
     QSpinBox* thumbnail_timer_spinner = nullptr;
     QSpinBox* thumbnail_limit_spinner = nullptr;
@@ -67,7 +69,7 @@ private:
     QLineEdit* CreateLineEdit(QWidget* parent_widget, QString setting);
     QComboBox* CreateComboBox(QWidget* parent_widget, QString setting, QVector<Text::Option> item_list);
     QComboBox* CreateComboCheckBox(QWidget* parent_widget, QString setting, QVector<Text::MetadataMethod> item_list);
-    QSpinBox* CreateSpinBox(QWidget* parent_widget, QString setting, int minumum = 0, int maximum = 100, int step = 1, QString suffix = "");
+    QSpinBox* CreateSpinBox(QWidget* parent_widget, QString setting, int minumum = 0, int maximum = 100, int step = 1, QString suffix = "", QString alt_suffix = "");
     SwitchButton* CreateSwitch(QWidget* parent_widget, QString setting, SwitchButton::Style style = SwitchButton::Style::YESNO);
     QPushButton* CreateButton(QWidget* parent_widget, QString text);
 
