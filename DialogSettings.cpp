@@ -51,20 +51,31 @@ DialogSettings::DialogSettings(UserSettings* user_settings, QWidget* parent) : Q
     );
     date_time_format_edit = CreateLineEdit(date_time_format, Field::Settings::CustomDateFormat);
     
-    QWidget* directory_history_limit = CreateWidget(general_tab);
-    QLabel* directory_history_limit_label = CreateLabel( directory_history_limit,
-        Text::from(Table::Settings, Field::Settings::MaxHistoryCount, Text::Label, ":"),
-        Text::from(Table::Settings, Field::Settings::MaxHistoryCount, Text::Description)
-    );
-    directory_history_limit_spinner = CreateSpinBox(directory_history_limit, Field::Settings::MaxHistoryCount);
-    
     QWidget* media_divider_handle_width = CreateWidget(general_tab);
-    QLabel* media_divider_handle_width_label = CreateLabel( media_divider_handle_width,
+    QLabel* media_divider_handle_width_label = CreateLabel(media_divider_handle_width,
         Text::from(Table::Settings, Field::Settings::MediaDividerHandleWidth, Text::Label, ":"),
         Text::from(Table::Settings, Field::Settings::MediaDividerHandleWidth, Text::Description)
     );
     media_divider_handle_width_spinner = CreateSpinBox(media_divider_handle_width, Field::Settings::MediaDividerHandleWidth);
 
+    QWidget* directory_history_limit = CreateWidget(general_tab);
+    QLabel* directory_history_limit_label = CreateLabel( directory_history_limit,
+        Text::from(Table::Settings, Field::Settings::MaxHistoryCount, Text::Label, ":"),
+        Text::from(Table::Settings, Field::Settings::MaxHistoryCount, Text::Description)
+    );
+    directory_history_limit_spinner = CreateSpinBox( directory_history_limit, Field::Settings::MaxHistoryCount);
+    
+    QWidget* sub_directory_look_ahead_limit = CreateWidget(general_tab);
+    QLabel* sub_directory_look_ahead_limit_label = CreateLabel( sub_directory_look_ahead_limit,
+        Text::from(Table::Settings, Field::Settings::SubDirectoryLookAhead, Text::Label, ":"),
+        Text::from(Table::Settings, Field::Settings::SubDirectoryLookAhead, Text::Description)
+    );
+    sub_directory_look_ahead_limit_spinner = CreateSpinBox( sub_directory_look_ahead_limit,
+        Field::Settings::SubDirectoryLookAhead, 0, 20, 1,
+        Text::from(Text::Measurement::Level, Text::Label, "", " "),
+        Text::from(Text::Measurement::Level, Text::LabelAlt, "", " ")
+    );
+    
     QWidget* sub_dir_sort_method = CreateWidget(general_tab);
     QLabel* sub_dir_sort_method_label = CreateLabel( sub_dir_sort_method,
         Text::from(Table::Settings, Field::Settings::SubDirectorySortMethod, Text::LabelAlt, ":"),
@@ -75,6 +86,13 @@ DialogSettings::DialogSettings(UserSettings* user_settings, QWidget* parent) : Q
         Text::getSubDirectorySortMethodOptions()
     );
 
+    QWidget* async_file_processing = CreateWidget(general_tab);
+    QLabel* async_video_processing_label = CreateLabel(async_file_processing,
+        Text::from(Table::Settings, Field::Settings::AsynchronousFileProcessing, Text::Label, ":"),
+        Text::from(Table::Settings, Field::Settings::AsynchronousFileProcessing, Text::Description)
+    );
+    async_file_processing_switch = CreateSwitch(async_file_processing, Field::Settings::AsynchronousFileProcessing);
+
     QWidget* modifier_key_select = CreateWidget(general_tab);
     QLabel* modifier_key_select_label = CreateLabel(modifier_key_select,
         Text::from(Table::Settings, Field::Settings::ModifierKeySelect, Text::Label, ":"),
@@ -84,6 +102,7 @@ DialogSettings::DialogSettings(UserSettings* user_settings, QWidget* parent) : Q
         Field::Settings::ModifierKeySelect,
         Text::getModifierKeyOptions()
     );
+
     QWidget* modifier_key_multi_select = CreateWidget(general_tab);
     QLabel* modifier_key_multi_select_label = CreateLabel(modifier_key_multi_select,
         Text::from(Table::Settings, Field::Settings::ModifierKeyMultiSelect, Text::Label, ":"),
@@ -93,6 +112,7 @@ DialogSettings::DialogSettings(UserSettings* user_settings, QWidget* parent) : Q
         Field::Settings::ModifierKeyMultiSelect,
         Text::getModifierKeyOptions()
     );
+
     QWidget* modifier_key_unselect = CreateWidget(general_tab);
     QLabel* modifier_key_unselect_label = CreateLabel(modifier_key_unselect,
         Text::from(Table::Settings, Field::Settings::ModifierKeyUnselect, Text::Label, ":"),
@@ -513,7 +533,7 @@ QComboBox* DialogSettings::CreateComboCheckBox(QWidget* parent_widget, QString s
     return combo_box;
 }
 
-QSpinBox* DialogSettings::CreateSpinBox(QWidget* parent_widget, QString setting, int minimum, int maximum, int step, QString suffix)
+QSpinBox* DialogSettings::CreateSpinBox(QWidget* parent_widget, QString setting, int minimum, int maximum, int step, QString suffix, QString alt_suffix)
 {
     QSpinBox* spin_box = new QSpinBox(parent_widget);
     spin_box->setFont(MA::Font::SettingsValueQ);
@@ -521,12 +541,25 @@ QSpinBox* DialogSettings::CreateSpinBox(QWidget* parent_widget, QString setting,
     spin_box->setRange(minimum, maximum);
     spin_box->setSingleStep(step);
     spin_box->setSizePolicy(QSizePolicy::Policy::Maximum, QSizePolicy::Policy::Fixed);
-    spin_box->setSuffix(suffix);
+    //spin_box->setSuffix(suffix);
     spin_box->setValue(user_settings->getUserSetting(setting).toInt());
     parent_widget->layout()->addWidget(spin_box);
 
+    if (alt_suffix.length()) {
+        if (spin_box->value() == 1)
+            spin_box->setSuffix(alt_suffix);
+        else
+            spin_box->setSuffix(suffix);
+    }
+
     connect(spin_box, &QSpinBox::valueChanged, this,
         [=](int number) {
+            if (alt_suffix.length()) {
+                if (number == 1)
+                    spin_box->setSuffix(alt_suffix);
+                else
+                    spin_box->setSuffix(suffix);
+            }
             user_settings->setUserSetting(setting, number);
         });
 
@@ -570,8 +603,10 @@ void DialogSettings::RevertSettingChanges()
     // General Settings
     date_time_format_edit->setText(user_settings->getUserSetting(Field::Settings::CustomDateFormat).toString());
     directory_history_limit_spinner->setValue(user_settings->getUserSetting(Field::Settings::MaxHistoryCount).toInt());
+    sub_directory_look_ahead_limit_spinner->setValue(user_settings->getUserSetting(Field::Settings::MaxHistoryCount).toInt());
     media_divider_handle_width_spinner->setValue(user_settings->getUserSetting(Field::Settings::MediaDividerHandleWidth).toInt());
     sub_dir_sort_method_combo->setCurrentIndex(user_settings->getUserSetting(Field::Settings::SubDirectorySortMethod).toInt());
+    async_file_processing_switch->setValue(DefaultValue::Settings::AsynchronousFileProcessing.toBool());
     modifier_key_select_combo->setCurrentIndex(MA::Keys::ModifierKeys.indexOf(user_settings->getUserSetting(Field::Settings::ModifierKeySelect).toInt()));
     modifier_key_multi_select_combo->setCurrentIndex(MA::Keys::ModifierKeys.indexOf(user_settings->getUserSetting(Field::Settings::ModifierKeyMultiSelect).toInt()));
     modifier_key_unselect_combo->setCurrentIndex(MA::Keys::ModifierKeys.indexOf(user_settings->getUserSetting(Field::Settings::ModifierKeyUnselect).toInt()));
@@ -603,8 +638,10 @@ void DialogSettings::RestoreDefaultSettings()
     // General Settings
     date_time_format_edit->setText(DefaultValue::Settings::CustomDateFormat.toString());
     directory_history_limit_spinner->setValue(DefaultValue::Settings::MaxHistoryCount.toInt());
+    sub_directory_look_ahead_limit_spinner->setValue(DefaultValue::Settings::MaxHistoryCount.toInt());
     media_divider_handle_width_spinner->setValue(DefaultValue::Settings::MediaDividerHandleWidth.toInt());
     sub_dir_sort_method_combo->setCurrentIndex(DefaultValue::Settings::SubDirectorySortMethod.toInt());
+    async_file_processing_switch->setValue(DefaultValue::Settings::AsynchronousFileProcessing.toBool());
     modifier_key_select_combo->setCurrentIndex(MA::Keys::ModifierKeys.indexOf(DefaultValue::Settings::ModifierKeySelect.toInt()));
     modifier_key_multi_select_combo->setCurrentIndex(MA::Keys::ModifierKeys.indexOf(DefaultValue::Settings::ModifierKeyMultiSelect.toInt()));
     modifier_key_unselect_combo->setCurrentIndex(MA::Keys::ModifierKeys.indexOf(DefaultValue::Settings::ModifierKeyUnselect.toInt()));
